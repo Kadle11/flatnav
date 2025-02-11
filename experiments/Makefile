@@ -6,48 +6,6 @@ export PYTHONPATH := $(CURDIR)/..
 
 
 ################################
-# Begin Billion-Scale Benchmarks
-################################
-
-# Billion-scale benchmark for the Microsoft SpaceV1B dataset
-# Reference: https://github.com/microsoft/SPTAG/tree/main/datasets/SPACEV1B
-
-space-v1b-bench-hnsw:
-	poetry run python run-benchmark.py \
-		--dataset-name msft-spacev-1b \
-		--dataset /root/data/SPACEV1B/collection.npy \
-		--queries /root/data/SPACEV1B/queries.npy \
-		--gtruth /root/data/SPACEV1B/ground_truth.npy \
-		--index-type hnsw \
-		--num-node-links 32 \
-		--ef-construction 30 50 100 \
-		--ef-search 100 200 300 500 1000 \
-		--num-build-threads 32 \
-		--num-search-threads 1 \
-		--metric l2
-
-
-space-v1b-bench-flatnav:
-	poetry run python run-benchmark.py \
-		--dataset-name msft-spacev-1b \
-		--dataset /root/data/SPACEV1B/collection.npy \
-		--queries /root/data/SPACEV1B/queries.npy \
-		--gtruth /root/data/SPACEV1B/ground_truth.npy \
-		--index-type flatnav \
-		--use-hnsw-base-layer \
-		--hnsw-base-layer-filename space-v1b.mtx \
-		--num-node-links 32 \
-		--ef-construction 30 50 100 \
-		--ef-search 100 200 300 500 1000 \
-		--num-build-threads 45 \
-		--num-search-threads 1 \
-		--metric l2
-
-################################
-# End Billion-Scale Benchmarks
-################################
-
-################################
 # Begin 100-Million Scale Benchmarks
 # ################################
 bigann-100m-hnsw: 
@@ -195,7 +153,7 @@ bigann-10m-flatnav:
                 --ef-construction 50 100 200 300 \
                 --ef-search 100 200 300 500 1000 3000 \
                 --metric l2 \
-                --num-build-threads 16 \
+                --num-build-threads 32 \
                 --num-search-threads 1
 
 
@@ -210,7 +168,7 @@ bigann-10m-hnsw:
                 --ef-construction 50 100 200 300 \
                 --ef-search 100 200 300 500 1000 3000 \
                 --metric l2 \
-                --num-build-threads 16 \
+                --num-build-threads 32 \
                 --num-search-threads 1
 
 
@@ -227,7 +185,7 @@ yandex-deep-10m-flatnav:
                 --ef-construction 50 100 200 300 \
                 --ef-search 100 200 300 500 1000 3000 \
         	--metric l2 \
-        	--num-build-threads 16 \
+        	--num-build-threads 32 \
         	--num-search-threads 1
 
 
@@ -242,7 +200,7 @@ yandex-deep-10m-hnsw:
                 --ef-construction 50 100 200 300 \
                 --ef-search 100 200 300 500 1000 3000 \
                 --metric l2 \
-                --num-build-threads 16 \
+                --num-build-threads 32 \
                 --num-search-threads 1
 
 
@@ -259,7 +217,7 @@ spacev-10m-flatnav:
                 --ef-construction 50 100 200 300 \
                 --ef-search 100 200 300 500 1000 3000 \
         	--metric l2 \
-        	--num-build-threads 38 \
+        	--num-build-threads 32 \
         	--num-search-threads 1
 
 
@@ -274,7 +232,7 @@ spacev-10m-hnsw:
                 --ef-construction 50 100 200 300 \
                 --ef-search 100 200 300 500 1000 3000 \
         	--metric l2 \
-        	--num-build-threads 16 \
+        	--num-build-threads 32 \
         	--num-search-threads 1
 
 
