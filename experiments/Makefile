@@ -21,117 +21,128 @@ bigann-100m-hnsw:
                 --metric l2 \
                 --num-build-threads 32 \
                 --num-search-threads 1
+bigann-100m-bench-flatnav: 
+	poetry run python run_benchmark.py \
+		--dataset-name bigann-100m \
+		--dataset /root/data/bigann/train_100m.npy \
+		--queries /root/data/bigann/queries.npy \
+		--gtruth /root/data/bigann/ground_truth_100m.npy \
+		--index-type flatnav \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename bigann-100m.mtx \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
-
-bigann-100m-flatnav: 
+bigann-100m-bench-hnsw: 
 	poetry run python run-benchmark.py \
-                --dataset-name bigann-100m \
-                --dataset /root/data/bigann/train_100m.npy \
-                --queries /root/data/bigann/queries.npy \
-                --gtruth /root/data/bigann/ground_truth_100m.npy \
-                --index-type flatnav \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename bigann-100m.mtx \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 \
-                --ef-search 100 200 300 500 1000 3000 \
-                --metric l2 \
-                --num-build-threads 32 \
-                --num-search-threads 1
+		--dataset-name bigann-100m \
+		--dataset /root/data/bigann/train_100m.npy \
+		--queries /root/data/bigann/queries.npy \
+		--gtruth /root/data/bigann/ground_truth_100m.npy \
+		--index-type flatnav \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
-
-yandex-deep-100m-hnsw:
+yandex-deep-100m-bench-flatnav:
 	poetry run python run-benchmark.py \
-                --dataset-name yandex-deep-100m \
-                --dataset /root/data/deep/train_100m.npy \
-                --queries /root/data/deep/queries.npy \
-                --gtruth /root/data/deep/ground_truth_100m.npy \
-            	--index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 \
-                --ef-search 100 200 300 500 1000 3000 \
-                --metric l2 \
-                --num-build-threads 32 \
-                --num-search-threads 1
+		--dataset-name yandex-deep-100m \
+		--dataset /root/data/deep/train_100m.npy \
+		--queries /root/data/deep/queries.npy \
+		--gtruth /root/data/deep/ground_truth_100m.npy \
+		--index-type flatnav \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename yandex-deep-100m.mtx \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-yandex-deep-100m-flatnav:
+yandex-deep-100m-bench-hnsw:
 	poetry run python run-benchmark.py \
-                --dataset-name yandex-deep-100m \
-                --dataset /root/data/deep/train_100m.npy \
-                --queries /root/data/deep/queries.npy \
-                --gtruth /root/data/deep/ground_truth_100m.npy \
-            	--index-type flatnav \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename yandex-deep-100m.mtx \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric l2 \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name yandex-deep-100m \
+		--dataset /root/data/deep/train_100m.npy \
+		--queries /root/data/deep/queries.npy \
+		--gtruth /root/data/deep/ground_truth_100m.npy \
+		--index-type hnsw \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-spacev-100m-flatnav:
+spacev-100m-bench-flatnav:
 	poetry run python run-benchmark.py \
-                --dataset-name spacev-100m \
-                --dataset /root/data/msspacev/train_100m.npy \
-                --queries /root/data/msspacev/queries.npy \
-                --gtruth /root/data/msspacev/ground_truth_100m.npy \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename spacev-100m.mtx \
-                --index-type flatnav \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric l2 \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name spacev-100m \
+		--dataset /root/data/msspacev/train_100m.npy \
+		--queries /root/data/msspacev/queries.npy \
+		--gtruth /root/data/msspacev/ground_truth_100m.npy \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename spacev-100m.mtx \
+		--index-type flatnav \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
-spacev-100m-hnsw:
+spacev-100m-bench-hnsw:
 	poetry run python run-benchmark.py \
-                --dataset-name spacev-100m \
-                --dataset /root/data/msspacev/train_100m.npy \
-                --queries /root/data/msspacev/queries.npy \
-                --gtruth /root/data/msspacev/ground_truth_100m.npy \
-            	--index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric l2 \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name spacev-100m \
+		--dataset /root/data/msspacev/train_100m.npy \
+		--queries /root/data/msspacev/queries.npy \
+		--gtruth /root/data/msspacev/ground_truth_100m.npy \
+		--index-type hnsw \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-tti-100m-flatnav:
-	poetry run python run-benchmark.py \
-        	--dataset-name tti-100m \
-        	--dataset /root/data/text2image/train_100m.npy \
-        	--queries /root/data/text2image/queries.npy \
-        	--gtruth /root/data/text2image/ground_truth_100m.npy \
-        	--index-type flatnav \
-        	--use-hnsw-base-layer \
-        	--hnsw-base-layer-filename tti-100m.mtx \
-        	--num-node-links 32 \
-        	--ef-construction 50 100 200 \
-        	--ef-search 100 200 300 500 1000 3000 \
-        	--metric angular \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
-
-tti-100m-hnsw:
+tti-100m-bench-flatnav:
 	poetry run python run-benchmark.py \
 		--dataset-name tti-100m \
-                --dataset /root/data/text2image/train_100m.npy \
-                --queries /root/data/text2image/queries.npy \
-                --gtruth /root/data/text2image/ground_truth_100m.npy \
-                --index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric angular \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset /root/data/text2image/train_100m.npy \
+		--queries /root/data/text2image/queries.npy \
+		--gtruth /root/data/text2image/ground_truth_100m.npy \
+		--index-type flatnav \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename tti-100m.mtx \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric angular \
+		--num-build-threads 32 \
+		--num-search-threads 1
+
+tti-100m-bench-hnsw:
+	poetry run python run-benchmark.py \
+		--dataset-name tti-100m \
+		--dataset /root/data/text2image/train_100m.npy \
+		--queries /root/data/text2image/queries.npy \
+		--gtruth /root/data/text2image/ground_truth_100m.npy \
+		--index-type hnsw \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric angular \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 ################################
 # End 100-Million Scale Benchmarks
@@ -140,131 +151,131 @@ tti-100m-hnsw:
 ################################
 # Begin 10-Million Scale Benchmarks
 # # ################################
-bigann-10m-flatnav: 
+bigann-10m-bench-flatnav: 
 	poetry run python run-benchmark.py \
-                --dataset-name bigann-10m \
-                --dataset /root/data/bigann/train_10m.npy \
-                --queries /root/data/bigann/queries.npy \
-                --gtruth /root/data/bigann/ground_truth_10m.npy \
-                --index-type flatnav \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename bigann-10m.mtx \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-                --metric l2 \
-                --num-build-threads 32 \
-                --num-search-threads 1
+		--dataset-name bigann-10m \
+		--dataset /root/data/bigann/train_10m.npy \
+		--queries /root/data/bigann/queries.npy \
+		--gtruth /root/data/bigann/ground_truth_10m.npy \
+		--index-type flatnav \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename bigann-10m.mtx \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-bigann-10m-hnsw:
+bigann-10m-bench-hnsw:
 	poetry run python run-benchmark.py \
-                --dataset-name bigann-10m \
-                --dataset /root/data/bigann/train_10m.npy \
-                --queries /root/data/bigann/queries.npy \
-                --gtruth /root/data/bigann/ground_truth_10m.npy \
-                --index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-                --metric l2 \
-                --num-build-threads 32 \
-                --num-search-threads 1
+		--dataset-name bigann-10m \
+		--dataset /root/data/bigann/train_10m.npy \
+		--queries /root/data/bigann/queries.npy \
+		--gtruth /root/data/bigann/ground_truth_10m.npy \
+		--index-type hnsw \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-yandex-deep-10m-flatnav:
+yandex-deep-10m-bench-flatnav:
 	poetry run python run-benchmark.py \
-                --dataset-name yandex-deep-10m \
-                --dataset /root/data/deep/train_10m.npy \
-                --queries /root/data/deep/queries.npy \
-                --gtruth /root/data/deep/ground_truth_10m.npy \
-            	--index-type flatnav \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename yandex-deep-10m.mtx \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric l2 \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name yandex-deep-10m \
+		--dataset /root/data/deep/train_10m.npy \
+		--queries /root/data/deep/queries.npy \
+		--gtruth /root/data/deep/ground_truth_10m.npy \
+		--index-type flatnav \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename yandex-deep-10m.mtx \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-yandex-deep-10m-hnsw:
+yandex-deep-10m-bench-hnsw:
 	poetry run python run-benchmark.py \
-                --dataset-name yandex-deep-10m \
-                --dataset /root/data/deep/train_10m.npy \
-                --queries /root/data/deep/queries.npy \
-                --gtruth /root/data/deep/ground_truth_10m.npy \
-            	--index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-                --metric l2 \
-                --num-build-threads 32 \
-                --num-search-threads 1
+		--dataset-name yandex-deep-10m \
+		--dataset /root/data/deep/train_10m.npy \
+		--queries /root/data/deep/queries.npy \
+		--gtruth /root/data/deep/ground_truth_10m.npy \
+		--index-type hnsw \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-spacev-10m-flatnav:
+spacev-10m-bench-flatnav:
 	poetry run python run-benchmark.py \
-                --dataset-name spacev-10m \
-                --dataset /root/data/msspacev/train_10m.npy \
-                --queries /root/data/msspacev/queries.npy \
-                --gtruth /root/data/msspacev/ground_truth_10m.npy \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename spacev-10m.mtx \
-                --index-type flatnav \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric l2 \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name spacev-10m \
+		--dataset /root/data/msspacev/train_10m.npy \
+		--queries /root/data/msspacev/queries.npy \
+		--gtruth /root/data/msspacev/ground_truth_10m.npy \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename spacev-10m.mtx \
+		--index-type flatnav \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-spacev-10m-hnsw:
+spacev-10m-bench-hnsw:
 	poetry run python run-benchmark.py \
-                --dataset-name spacev-10m \
-                --dataset /root/data/msspacev/train_10m.npy \
-                --queries /root/data/msspacev/queries.npy \
-                --gtruth /root/data/msspacev/ground_truth_10m.npy \
-            	--index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric l2 \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name spacev-10m \
+		--dataset /root/data/msspacev/train_10m.npy \
+		--queries /root/data/msspacev/queries.npy \
+		--gtruth /root/data/msspacev/ground_truth_10m.npy \
+		--index-type hnsw \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric l2 \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 
-tti-10m-flatnav:
+tti-10m-bench-flatnav:
 	poetry run python run-benchmark.py \
-                --dataset-name tti-10m \
-                --dataset /root/data/text2image/train_10m.npy \
-                --queries /root/data/text2image/queries.npy \
-                --gtruth /root/data/text2image/ground_truth_10m.npy \
-            	--index-type flatnav \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename tti-10m.mtx \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric angular \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name tti-10m \
+		--dataset /root/data/text2image/train_10m.npy \
+		--queries /root/data/text2image/queries.npy \
+		--gtruth /root/data/text2image/ground_truth_10m.npy \
+		--index-type flatnav \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename tti-10m.mtx \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric angular \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
-tti-10m-hnsw:
+tti-10m--bench-hnsw:
 	poetry run python run-benchmark.py \
-                --dataset-name tti-10m \
-                --dataset /root/data/text2image/train_10m.npy \
-                --queries /root/data/text2image/queries.npy \
-                --gtruth /root/data/text2image/ground_truth_10m.npy \
-            	--index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
-        	--metric angular \
-        	--num-build-threads 32 \
-        	--num-search-threads 1
+		--dataset-name tti-10m \
+		--dataset /root/data/text2image/train_10m.npy \
+		--queries /root/data/text2image/queries.npy \
+		--gtruth /root/data/text2image/ground_truth_10m.npy \
+		--index-type hnsw \
+		--num-node-links 32 \
+		--ef-construction 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
+		--metric angular \
+		--num-build-threads 32 \
+		--num-search-threads 1
 
 ################################
 # End 10-Million Scale Benchmarks
@@ -275,35 +286,35 @@ tti-10m-hnsw:
 # Ref: https://ann-benchmarks.com/
 ################################
 
-deep-image-flatnav: 
+deep-image-bench-flatnav: 
 	poetry run python run-benchmark.py \
 		--dataset-name deep-image-96 \
 		--dataset /root/data/deep-image-96-angular/deep-image-96-angular.train.npy \
 		--queries /root/data/deep-image-96-angular/deep-image-96-angular.test.npy \
 		--gtruth /root/data/deep-image-96-angular/deep-image-96-angular.gtruth.npy \
 		--index-type flatnav \
-                --use-hnsw-base-layer \
-                --hnsw-base-layer-filename deep-image.mtx \
-                --num-node-links 32 \
-                --ef-construction 30 40 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
+		--use-hnsw-base-layer \
+		--hnsw-base-layer-filename deep-image.mtx \
+		--num-node-links 32 \
+		--ef-construction 30 40 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
 		--metric l2 \
 		--num-build-threads 16 \
-                --num-search-threads 1
+        --num-search-threads 1
 
-deep-image-hnsw: 
+deep-image-bench-hnsw: 
 	poetry run python run-benchmark.py \
 		--dataset-name deep-image-96 \
 		--dataset /root/data/deep-image-96-angular/deep-image-96-angular.train.npy \
 		--queries /root/data/deep-image-96-angular/deep-image-96-angular.test.npy \
 		--gtruth /root/data/deep-image-96-angular/deep-image-96-angular.gtruth.npy \
 		--index-type hnsw \
-                --num-node-links 32 \
-                --ef-construction 30 40 50 100 200 300 \
-                --ef-search 100 200 300 500 1000 3000 \
+		--num-node-links 32 \
+		--ef-construction 30 40 50 100 200 300 \
+		--ef-search 100 200 300 500 1000 3000 \
 		--metric l2 \
 		--num-build-threads 16 \
-                --num-search-threads 1
+        --num-search-threads 1
 
 mnist-bench-flatnav: 
 	poetry run python run-benchmark.py \
@@ -438,12 +449,25 @@ sift-bench-hnsw:
 		--num-build-threads 16 \
 		--num-search-threads 1
 
+<<<<<<< HEAD
 hubness-test:
 	poetry run python hubness.py \
 		--datasets normal-1-angular normal-2-angular normal-4-angular normal-8-angular normal-16-angular normal-32-angular normal-64-angular normal-128-angular normal-256-angular normal-1024-angular normal-1536-angular normal-1-euclidean normal-2-euclidean normal-4-euclidean normal-8-euclidean normal-16-euclidean normal-32-euclidean normal-64-euclidean normal-128-euclidean normal-256-euclidean normal-1024-euclidean normal-1536-euclidean \
 		--k 100 \
 		--ef-construction 100 \
 		--ef-search 200 \
+=======
+
+glove25-bench-flatnav:
+	poetry run python run-benchmark.py \
+		--dataset /root/data/glove-25-angular/glove-25-angular.train.npy \
+		--queries /root/data/glove-25-angular/glove-25-angular.test.npy \
+		--gtruth /root/data/glove-25-angular/glove-25-angular.gtruth.npy \
+		--dataset-name glove-25-angular \
+		--index-type flatnav \
+		--use-hnsw-base-layer \
+        --hnsw-base-layer-filename glove25.mtx \
+>>>>>>> 4734a1b (Add commands for all benchmarks)
 		--num-node-links 32 \
 		--hubness-scores hubness-scores.json
 
@@ -474,7 +498,7 @@ glove50-bench-flatnav:
 		--dataset-name glove-50-angular \
 		--index-type flatnav \
 		--use-hnsw-base-layer \
-                --hnsw-base-layer-filename glove50.mtx \
+        --hnsw-base-layer-filename glove50.mtx \
 		--num-node-links 32 \
 		--ef-construction 30 40 50 100 200 300 \
 		--ef-search 100 200 300 500 1000 3000 \
