@@ -1,6 +1,6 @@
 # Build arguments 
 # debian:buster-slim is much smaller than ubuntu 22
-ARG BASE_IMAGE=debian:buster-slim
+ARG BASE_IMAGE=debian:bullseye-slim
 
 FROM ${BASE_IMAGE} AS base
 
@@ -40,18 +40,26 @@ RUN apt-get update -y \
         gcc \
         g++ \
         apt-utils \
+        ninja-build \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /tmp/*
 
+# Install CMake 3.21+ (required by python-bindings)
+RUN wget -q https://github.com/Kitware/CMake/releases/download/v3.27.7/cmake-3.27.7-linux-x86_64.sh \
+    && mkdir -p /opt/cmake \
+    && sh cmake-3.27.7-linux-x86_64.sh --skip-license --prefix=/opt/cmake \
+    && rm cmake-3.27.7-linux-x86_64.sh
+ENV PATH="/opt/cmake/bin:${PATH}"
+
 # Install python 
 # We use pyenv to manage python versions 
-ENV PYENV_ROOT=$HOME/.pyenv
+ENV PYENV_ROOT=${ROOT_DIR}/.pyenv
 
 # Shims are small proxy executables that intercept calls to Python commands. 
 # Putting $PYENV_ROOT/shims at the beginning of PATH ensures that the shimmed 
 # Python commands are found and used before any system-wide Python installations.
-ENV PATH=$PYENV_ROOT/shims:$PYENV_ROOT/bin:$PATH 
+ENV PATH=${PYENV_ROOT}/shims:${PYENV_ROOT}/bin:${PATH}
 
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 
@@ -78,12 +86,21 @@ ENV PATH="${POETRY_HOME}/bin:${PATH}"
 WORKDIR ${FLATNAV_PATH}
 
 # Copy source code
-COPY include/flatnav/ ./flatnav/
+COPY include/ ./include/
 COPY python-bindings/ ./python-bindings/
 COPY experiments/ ./experiments/
+COPY README.md ./README.md
 
 # Copy external dependencies (for now only cereal)
 COPY external/ ./external/
+
+# Build flatnav wheel from source (with scikit-build for CMake integration)
+WORKDIR ${FLATNAV_PATH}/python-bindings
+RUN pip install --upgrade pip wheel setuptools scikit-build && \
+    rm -rf build dist *.egg-info && \
+    python setup.py bdist_wheel
+
+ENV FLATNAV_WHEEL=${FLATNAV_PATH}/python-bindings/dist/*.whl
 
 # Install needed dependencies including flatnav. 
 # Install hnwlib (from a forked repo that has extensions we need)
@@ -99,6 +116,6 @@ RUN if [ "$INCLUDE_HNSWLIB" = true ] ; then \
 # Get the wheel as an environment variable 
 ENV HNSWLIB_WHEEL=${FLATNAV_PATH}/hnswlib-original/python_bindings/dist/*.whl
 
-# Add hnswlib to the experiment runner 
+# Add flatnav, faiss-cpu, and hnswlib to the experiment runner 
 WORKDIR ${FLATNAV_PATH}/experiments
-RUN poetry add ${HNSWLIB_WHEEL} && poetry install --no-root
+RUN poetry add ${FLATNAV_WHEEL} faiss-cpu ${HNSWLIB_WHEEL} && poetry install --no-root

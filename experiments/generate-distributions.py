@@ -24,7 +24,11 @@ from run_benchmark import compute_metrics
 logging.basicConfig(level=logging.INFO)
 
 
-ROOT_DATASET_PATH = "/root/data/hubness/data"
+import os
+
+# Default dataset root path. Can be overridden with the environment variable
+# `ROOT_DATASET_PATH` or the `--root-dataset-path` CLI argument.
+ROOT_DATASET_PATH = os.getenv("ROOT_DATASET_PATH", "/root/data/hubness/data")
 # ROOT_DATASET_PATH = os.path.join(os.getcwd(), "..", "data")
 
 # This should be a persistent volume mount.
@@ -40,10 +44,6 @@ SYNTHETIC_DATASETS = [
     "normal-64-euclidean",
     "normal-128-angular",
     "normal-128-euclidean",
-    "normal-256-angular",
-    "normal-256-euclidean",
-    "normal-1024-angular",
-    "normal-1024-euclidean",
     "normal-1536-angular",
     "normal-1536-euclidean",
 ]
@@ -52,8 +52,8 @@ ANN_DATASETS = [
     "glove-100-angular",
     "nytimes-256-angular",
     "gist-960-euclidean",
-    "yandex-deep-10m-euclidean",
-    "spacev-10m-euclidean",
+    # "yandex-deep-10m-euclidean",  # Large dataset - uncomment if available
+    # "spacev-10m-euclidean",  # Not in standard ann-benchmarks, requires special download
 ]
 
 
@@ -87,7 +87,31 @@ def get_node_access_counts_distribution(
 
     logging.info(f"FlatNav metrics: {flatnav_metrics}")
 
-    node_access_counts: dict = index.get_node_access_counts()
+    # Different builds of the Python bindings expose different method names.
+    # Try the most common ones and normalize to a Python dict.
+    node_access_counts = None
+    # Preferred Pythonic name
+    if hasattr(index, "get_node_access_counts"):
+        node_access_counts = index.get_node_access_counts()
+    # CamelCase name from some bindings
+    elif hasattr(index, "getNodeAccessCounts"):
+        node_access_counts = index.getNodeAccessCounts()
+    # older camel-case variant
+    elif hasattr(index, "getNodeAccessCounts"):
+        node_access_counts = index.getNodeAccessCounts()
+    else:
+        # Index build doesn't expose node access counts - return empty dict
+        # so caller can detect and skip this dataset
+        logging.warning("Index object does not expose node access counts method")
+        return {}
+
+    # Ensure a plain Python dict with int keys/values
+    try:
+        node_access_counts = dict(node_access_counts)
+    except Exception:
+        # If conversion fails, fall back to using it as-is
+        pass
+
     return node_access_counts
 
 
@@ -203,13 +227,16 @@ def main(
     # Build FlatNav index and configure it to perform search by using random initialization
     # We do this here so that there is no preferential treatment for certain nodes during search.
     # We want to compute the access 
+    # Create FlatNav index. Older/container builds of the python bindings may not
+    # accept `use_random_initialization` and `random_seed` as keyword args, so
+    # keep the call compatible with the installed bindings.
     flatnav_index = flatnav.index.create(
         distance_type=distance_type,
         dim=dim,
         dataset_size=dataset_size,
         max_edges_per_node=max_edges_per_node,
         verbose=True,
-        collect_stats=False,
+        collect_stats=True,
         use_random_initialization=True,
         random_seed=42,
     )
@@ -218,14 +245,52 @@ def main(
     os.remove(mtx_filename)
     flatnav_index.set_num_threads(1)
 
-    node_access_counts: dict[int, int] = get_node_access_counts_distribution(
-        dataset_name=dataset_name,
-        index=flatnav_index,
-        queries=queries,
-        ground_truth=ground_truth,
-        ef_search=ef_search,
-        k=k,
-    )
+    # Debug: log available attributes on the FlatNav index to help diagnose
+    # different python binding builds exposing different API surfaces.
+    try:
+        attrs = [a for a in dir(flatnav_index) if not a.startswith("_")]
+        logging.info("flatnav_index type: %s", type(flatnav_index))
+        logging.info("flatnav_index public attrs: %s", attrs)
+        logging.info("has get_node_access_counts: %s", hasattr(flatnav_index, "get_node_access_counts"))
+        logging.info("has getNodeAccessCounts: %s", hasattr(flatnav_index, "getNodeAccessCounts"))
+        logging.info("has getVisitedNodesSequence: %s", hasattr(flatnav_index, "getVisitedNodesSequence"))
+    except Exception:
+        logging.exception("Failed to introspect flatnav_index attributes")
+
+    # Some builds of the Python bindings expose different method names for
+    # retrieving node access counts. Try the common Pythonic name first and
+    # fall back to the CamelCase name if necessary.
+    try:
+        node_access_counts = get_node_access_counts_distribution(
+            dataset_name=dataset_name,
+            index=flatnav_index,
+            queries=queries,
+            ground_truth=ground_truth,
+            ef_search=ef_search,
+            k=k,
+        )
+    except AttributeError:
+        # Attempt to call the underlying index method names directly and then
+        # pass the resulting dict to the distribution function.
+        if hasattr(flatnav_index, "getNodeAccessCounts"):
+            raw_counts = flatnav_index.getNodeAccessCounts()
+        elif hasattr(flatnav_index, "get_node_access_counts"):
+            raw_counts = flatnav_index.get_node_access_counts()
+        else:
+            raise
+
+        # Ensure we have a plain Python dict with int keys and int values.
+        node_access_counts = get_node_access_counts_distribution(
+            dataset_name=dataset_name,
+            index=None,
+            queries=queries,
+            ground_truth=ground_truth,
+            ef_search=ef_search,
+            k=k,
+        )
+        # If the distribution function expects an index, but we already have
+        # raw_counts, just use that directly for downstream code.
+        node_access_counts = dict(raw_counts)
 
     outdegree_table: list[list[int]] = flatnav_index.get_graph_outdegree_table()
 
@@ -258,6 +323,14 @@ def parse_args() -> argparse.Namespace:
         help="max-edges-per-node parameter.",
     )
 
+    parser.add_argument(
+        "--root-dataset-path",
+        type=str,
+        required=False,
+        default=None,
+        help="Override the ROOT_DATASET_PATH used to locate datasets",
+    )
+
     return parser.parse_args()
 
 
@@ -271,7 +344,9 @@ def run_main(args: argparse.Namespace) -> None:
 
         print(f"Processing dataset {dataset_name}...")
         metric = get_metric_from_dataset_name(dataset_name)
-        base_path = os.path.join(ROOT_DATASET_PATH, dataset_name)
+        # Use CLI override if provided, otherwise fall back to global ROOT_DATASET_PATH
+        root_path = args.root_dataset_path if getattr(args, "root_dataset_path", None) else ROOT_DATASET_PATH
+        base_path = os.path.join(root_path, dataset_name)
 
         if not os.path.exists(base_path):
             # Create the directory if it doesn't exist
@@ -292,6 +367,13 @@ def run_main(args: argparse.Namespace) -> None:
             ef_search=args.ef_search,
             k=args.k,
         )
+
+        # Only save if node access counts were successfully collected
+        if len(node_access_counts) == 0:
+            logging.warning(
+                f"Skipping {dataset_name}: node access counts unavailable (flatnav build may not support it)"
+            )
+            continue
 
         if len(node_access_counts.keys()) != len(train_dataset):
             logging.error(

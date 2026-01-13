@@ -8,15 +8,6 @@ set(VERSION_INFO "0.1.2")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Include directories
-include_directories(${CMAKE_SOURCE_DIR}/src/flatnav)
-# Add include directories for the target
-# 1. Where to find header files for flatnav CPP
-# 2. Where to find header files for cereal
-include_directories(${CMAKE_SOURCE_DIR}/../include)
-include_directories(${CMAKE_SOURCE_DIR}/../external/cereal/include)
-
-
 # Fetch Pybind11
 include(FetchContent)
 FetchContent_Declare(
@@ -44,6 +35,16 @@ set(CPP_SOURCE
 # Add library for the Python extension
 pybind11_add_module(_core MODULE ${CPP_SOURCE})
 target_compile_definitions(_core PRIVATE VERSION_INFO=${VERSION_INFO})
+
+# Add include directories for the target
+# 1. Where to find header files for flatnav CPP bindings
+# 2. Where to find header files for flatnav CPP library
+# 3. Where to find header files for cereal
+target_include_directories(_core PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/flatnav
+    ${CMAKE_SOURCE_DIR}/../include
+    ${CMAKE_SOURCE_DIR}/../external/cereal/include
+)
 
 # Print include directories for the target
 get_property(INCLUDE_DIRS TARGET _core PROPERTY INCLUDE_DIRECTORIES)

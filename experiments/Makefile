@@ -1,4 +1,6 @@
 # This file contains the benchmarking script configurations for various near neighbor datasets
+# Ensure Python can import the top-level `experiments` package when running recipes
+export PYTHONPATH := $(CURDIR)/..
 # The main configurable parameter is the type of index: --index-type (hnsw, flatnav)
 # We use dataset-name for the name of the plots.
 
@@ -446,9 +448,10 @@ hubness-test:
 		--hubness-scores hubness-scores.json
 
 
+
 generate-datasets:
 	poetry run python generate-datasets.py \
-		--base-path /home/ubuntu/flatnav/data \
+		--base-path /root/data \
 		--dataset-size 1010000 \
 		--num-queries 10000 \
 		--dimensions 1 2 4 8 16 32 64 128 1536 \

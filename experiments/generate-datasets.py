@@ -145,6 +145,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--dataset-size", type=int, required=True)
     parser.add_argument("--num-queries", type=int, required=True)
     parser.add_argument("--dimensions", type=int, nargs="+", required=True)
+    parser.add_argument("--base-path", type=str, default="/root/data", help="Base path to save generated datasets")
     parser.add_argument("--k", type=int, default=100)
 
     return parser.parse_args()
@@ -153,8 +154,7 @@ def parse_arguments() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_arguments()
     dimensions = args.dimensions
-
-    base_path = "/root/data"
+    base_path = args.base_path
     DATASET_NAMES = [f"normal-{d}-angular" for d in dimensions]
     DATASET_NAMES += [f"normal-{d}-euclidean" for d in dimensions]
 

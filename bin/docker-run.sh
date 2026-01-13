@@ -114,5 +114,7 @@ docker run \
         -it \
         --volume ${DATA_DIR}:/root/data \
         --volume ${METRICS_DIR}:/root/metrics \
+        --volume $(pwd)/node-access-distributions:/root/node-access-distributions \
+        --volume $(pwd)/edge-lengths:/root/edge-lengths \
         --rm flatnav:$TAG_NAME \
         make $1

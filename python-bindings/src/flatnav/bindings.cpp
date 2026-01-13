@@ -258,7 +258,7 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     if (_verbose) {
       uint64_t total_index_memory = _index->getTotalIndexMemory();
       uint64_t visited_set_allocated_memory = _index->visitedSetPoolAllocatedMemory();
-      std::cout << "Total allocated index memory: " << (float)(total_memory / 1e9) << " GB \n" << std::flush;
+      std::cout << "Total allocated index memory: " << (float)(total_index_memory / 1e9) << " GB \n" << std::flush;
       std::cout << "[WARN]: More memory might be allocated due to visited sets "
                    "in multi-threaded environments.\n"
                 << std::flush;
