@@ -41,6 +41,7 @@ RUN apt-get update -y \
         g++ \
         apt-utils \
         ninja-build \
+        linux-perf \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /tmp/*

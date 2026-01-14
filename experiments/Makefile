@@ -632,6 +632,16 @@ speed-test:
 plot-speed-test-results:
 	poetry run python plot_speed_test_results.py
 
+# Profile hub vs non-hub compute and memory performance
+profile-hub-compute:
+	poetry run python profile_hub_compute.py \
+		--dataset glove-100-angular \
+		--k 100 \
+		--ef-construction 100 \
+		--ef-search 200 \
+		--num-node-links 32 \
+		--hub-percentile 90
+
 plot-results:
 	poetry run python plot_stats_test_results.py
 

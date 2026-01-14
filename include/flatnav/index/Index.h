@@ -88,6 +88,10 @@ class Index {
   mutable std::atomic<uint64_t> _distance_computations = 0;
   mutable std::atomic<uint64_t> _metric_hops = 0;
 
+  // Hub vs non-hub profiling counters
+  mutable std::atomic<uint64_t> _hub_distance_computations = 0;
+  mutable std::atomic<uint64_t> _nonhub_distance_computations = 0;
+
   // Keep track of the sequence of nodes visited during search.
   // Each internal list consists of a sequence of boolean flags indicating
   // whether a visited node is a hub node or not.
@@ -639,9 +643,18 @@ class Index {
 
   inline DataType getDataType() const { return _data_type; }
 
+  // Search mode for profiling: allows filtering to only traverse hub or non-hub nodes
+  enum class SearchMode { NORMAL, HUB_ONLY, NONHUB_ONLY };
+
+ private:
+  SearchMode _search_mode = SearchMode::NORMAL;
+
+ public:
   void resetStats() {
     _distance_computations = 0;
     _metric_hops = 0;
+    _hub_distance_computations = 0;
+    _nonhub_distance_computations = 0;
   }
 
   // Return a reference to the node access counts
@@ -649,6 +662,18 @@ class Index {
   getNodeAccessCounts() const {
     return _node_access_counts;
   }
+
+  // Hub vs non-hub profiling methods
+  inline uint64_t hubDistanceComputations() const {
+    return _hub_distance_computations.load();
+  }
+
+  inline uint64_t nonhubDistanceComputations() const {
+    return _nonhub_distance_computations.load();
+  }
+
+  void setSearchMode(SearchMode mode) { _search_mode = mode; }
+  SearchMode getSearchMode() const { return _search_mode; }
 
   void getIndexSummary() const {
     std::cout << "\nIndex Parameters\n" << std::flush;
@@ -738,6 +763,16 @@ class Index {
     float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
                                      /* asymmetric = */ true);
 
+    // Track entry node distance computation for profiling
+    if (_collect_stats && is_search_stage) {
+      _distance_computations.fetch_add(1);
+      if (_hub_nodes[entry_node]) {
+        _hub_distance_computations.fetch_add(1);
+      } else {
+        _nonhub_distance_computations.fetch_add(1);
+      }
+    }
+
     float max_dist = dist;
     candidates.emplace(-dist, entry_node);
     neighbors.emplace(dist, entry_node);
@@ -799,6 +834,14 @@ class Index {
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
 
+      // Filter based on search mode for profiling
+      if (_search_mode == SearchMode::HUB_ONLY && !_hub_nodes[neighbor_node_id]) {
+        continue;  // Skip non-hub nodes in HUB_ONLY mode
+      }
+      if (_search_mode == SearchMode::NONHUB_ONLY && _hub_nodes[neighbor_node_id]) {
+        continue;  // Skip hub nodes in NONHUB_ONLY mode
+      }
+
       if (is_search_stage) {
         // Collect node access counts statistics. We will assume that we are in
         // a single-threaded environment so we don't need to lock the access
@@ -827,6 +870,12 @@ class Index {
 
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
+        // Track hub vs non-hub distance computations for profiling
+        if (_hub_nodes[neighbor_node_id]) {
+          _hub_distance_computations.fetch_add(1);
+        } else {
+          _nonhub_distance_computations.fetch_add(1);
+        }
       }
 
       if (neighbors.size() < buffer_size || dist < max_dist) {

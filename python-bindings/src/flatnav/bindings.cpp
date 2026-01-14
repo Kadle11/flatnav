@@ -280,6 +280,29 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     return distance_computations;
   }
 
+  // Hub profiling methods
+  uint64_t hubDistanceComputations() const {
+    return _index->hubDistanceComputations();
+  }
+
+  uint64_t nonhubDistanceComputations() const {
+    return _index->nonhubDistanceComputations();
+  }
+
+  void resetStats() {
+    _index->resetStats();
+  }
+
+  void setSearchMode(int mode) {
+    using SearchMode = typename Index<dist_t, label_t>::SearchMode;
+    switch (mode) {
+      case 0: _index->setSearchMode(SearchMode::NORMAL); break;
+      case 1: _index->setSearchMode(SearchMode::HUB_ONLY); break;
+      case 2: _index->setSearchMode(SearchMode::NONHUB_ONLY); break;
+      default: throw std::invalid_argument("Invalid search mode. Use 0=NORMAL, 1=HUB_ONLY, 2=NONHUB_ONLY");
+    }
+  }
+
   void buildGraphLinks(const std::string& mtx_filename) {
     _index->buildGraphLinks(/* mtx_filename = */ mtx_filename);
   }
@@ -479,6 +502,15 @@ void bindSpecialization(py::module_& index_submodule) {
            GET_QUERY_DISTANCE_COMPUTATIONS_DOCSTRING)
       .def("save", &IndexType::save, py::arg("filename"), SAVE_DOCSTRING)
       .def("get_node_access_counts", &IndexType::getNodeAccessCounts,"")
+      .def("get_hub_distance_computations", &IndexType::hubDistanceComputations,
+           "Returns the number of distance computations to hub nodes during search")
+      .def("get_nonhub_distance_computations", &IndexType::nonhubDistanceComputations,
+           "Returns the number of distance computations to non-hub nodes during search")
+      .def("reset_stats", &IndexType::resetStats,
+           "Reset all profiling statistics (distance computations, hub/non-hub counters)")
+      .def("set_search_mode", &IndexType::setSearchMode,
+           py::arg("mode"),
+           "Set search mode for profiling: 0=NORMAL, 1=HUB_ONLY (skip non-hubs), 2=NONHUB_ONLY (skip hubs)")
       .def("build_graph_links", &IndexType::buildGraphLinks,
            py::arg("mtx_filename"), BUILD_GRAPH_LINKS_DOCSTRING)
       .def("get_graph_outdegree_table", &IndexType::getGraphOutdegreeTable,

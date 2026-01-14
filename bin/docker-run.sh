@@ -111,6 +111,7 @@ fi
 # to upload the indexes to s3. This is not the most secure thing to do, but it's the easiest.
 docker run \
         --name $CONTAINER_NAME \
+        --privileged \
         -it \
         --volume ${DATA_DIR}:/root/data \
         --volume ${METRICS_DIR}:/root/metrics \
