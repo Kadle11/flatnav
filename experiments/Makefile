@@ -635,7 +635,7 @@ plot-speed-test-results:
 # Profile hub vs non-hub compute and memory performance
 profile-hub-compute:
 	poetry run python profile_hub_compute.py \
-		--dataset glove-100-angular \
+		--dataset nytimes-256-angular \
 		--k 100 \
 		--ef-construction 100 \
 		--ef-search 200 \

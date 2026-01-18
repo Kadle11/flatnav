@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Profile Hub vs Non-Hub Vector Search Performance
+Profile Vector Search Performance with Hub/Non-Hub Breakdown
 
-This script measures compute and memory bandwidth utilization separately for
-hub and non-hub node distance computations during vector search.
+This script measures compute and memory bandwidth utilization during vector search,
+providing a breakdown of distance computations between hub and non-hub nodes.
 
 Usage:
     python profile_hub_compute.py --dataset glove-100-angular --ef-search 200 --k 100
@@ -38,10 +38,8 @@ from utils import get_metric_from_dataset_name, load_dataset
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Search modes (must match C++ enum)
+# Search mode (must match C++ enum)
 SEARCH_MODE_NORMAL = 0
-SEARCH_MODE_HUB_ONLY = 1
-SEARCH_MODE_NONHUB_ONLY = 2
 
 # Default dataset path
 ROOT_DATASET_PATH = os.getenv("ROOT_DATASET_PATH", "/root/data/hubness/data")
@@ -523,15 +521,13 @@ def run_full_profiling(
     ef_search: int,
     k: int,
     hub_percentile: float = 90,
-) -> Dict[str, ProfilingResult]:
+) -> ProfilingResult:
     """
-    Run full profiling with all three passes.
+    Run profiling with normal search pass.
     
     Returns:
-        Dict mapping mode name to ProfilingResult
+        ProfilingResult with all metrics
     """
-    results = {}
-    
     # Build index
     logging.info(f"Building index for {dataset_name}...")
     index, mtx_filename = build_index_with_hnsw(
@@ -557,22 +553,10 @@ def run_full_profiling(
     hub_nodes = select_hub_nodes(node_access_counts, hub_percentile)
     index.set_hub_nodes(hub_nodes)
     
-    # Pass 1: Normal search (baseline)
-    results['normal'] = run_profiling_pass(
+    # Run normal search pass with profiling
+    result = run_profiling_pass(
         index, queries, ground_truth, k, ef_search,
         SEARCH_MODE_NORMAL, "normal", hub_nodes, distance_type, use_perf=True
-    )
-    
-    # Pass 2: Hub-only search
-    results['hub_only'] = run_profiling_pass(
-        index, queries, ground_truth, k, ef_search,
-        SEARCH_MODE_HUB_ONLY, "hub_only", hub_nodes, distance_type, use_perf=True
-    )
-    
-    # Pass 3: Non-hub-only search
-    results['nonhub_only'] = run_profiling_pass(
-        index, queries, ground_truth, k, ef_search,
-        SEARCH_MODE_NONHUB_ONLY, "nonhub_only", hub_nodes, distance_type, use_perf=True
     )
     
     # Cleanup
@@ -581,29 +565,27 @@ def run_full_profiling(
     except OSError:
         pass
     
-    return results
+    return result
 
 
-def print_profiling_summary(results: Dict[str, ProfilingResult], dataset_name: str):
+def print_profiling_summary(result: ProfilingResult, dataset_name: str):
     """Print a summary of profiling results."""
     print("\n" + "=" * 80)
     print(f"PROFILING RESULTS: {dataset_name}")
     print("=" * 80)
     
     print("\n### Distance Computation Breakdown ###")
-    print(f"{'Mode':<15} {'Total Comps':>15} {'Hub Comps':>15} {'Non-Hub Comps':>15} {'Time (ms)':>12}")
-    print("-" * 75)
-    
-    for mode, result in results.items():
-        print(f"{mode:<15} {result.total_distance_computations:>15,} "
-              f"{result.hub_distance_computations:>15,} "
-              f"{result.nonhub_distance_computations:>15,} "
-              f"{result.total_search_time_ms:>12.2f}")
+    print(f"{'Total Comps':>15} {'Hub Comps':>15} {'Non-Hub Comps':>15} {'Time (ms)':>12}")
+    print("-" * 60)
+    print(f"{result.total_distance_computations:>15,} "
+          f"{result.hub_distance_computations:>15,} "
+          f"{result.nonhub_distance_computations:>15,} "
+          f"{result.total_search_time_ms:>12.2f}")
     
     print("\n### Hardware Metrics (perf) ###")
     
-    # Check if any perf metrics were collected
-    has_perf_data = any(r.perf_metrics.cycles > 0 for r in results.values())
+    # Check if perf metrics were collected
+    has_perf_data = result.perf_metrics.cycles > 0
     
     if not has_perf_data:
         print("⚠️  WARNING: No hardware metrics collected!")
@@ -617,85 +599,76 @@ def print_profiling_summary(results: Dict[str, ProfilingResult], dataset_name: s
         print("\n   Then rebuild and rerun the Docker container.")
         print("\n   Software-only metrics (timing, computation counts) are still valid below.\n")
     
-    print(f"{'Mode':<15} {'Cycles':>15} {'Instructions':>15} {'IPC':>8} {'Cache Miss %':>12} {'L1 Miss %':>10}")
-    print("-" * 85)
-    for mode, result in results.items():
-        pm = result.perf_metrics
-        cache_miss_pct = pm.cache_miss_rate * 100 if pm.cache_miss_rate > 0 else 0
-        l1_miss_pct = pm.l1_miss_rate * 100 if pm.l1_miss_rate > 0 else 0
-        print(f"{mode:<15} {pm.cycles:>15,} {pm.instructions:>15,} "
-              f"{pm.ipc:>8.3f} {cache_miss_pct:>11.2f}% {l1_miss_pct:>9.2f}%")
+    pm = result.perf_metrics
+    cache_miss_pct = pm.cache_miss_rate * 100 if pm.cache_miss_rate > 0 else 0
+    l1_miss_pct = pm.l1_miss_rate * 100 if pm.l1_miss_rate > 0 else 0
+    
+    print(f"{'Cycles':>15} {'Instructions':>15} {'IPC':>8} {'Cache Miss %':>12} {'L1 Miss %':>10}")
+    print("-" * 65)
+    print(f"{pm.cycles:>15,} {pm.instructions:>15,} "
+          f"{pm.ipc:>8.3f} {cache_miss_pct:>11.2f}% {l1_miss_pct:>9.2f}%")
     
     print("\n### Per-Distance-Computation Hardware Metrics ###")
-    print(f"{'Mode':<15} {'Cycles/Comp':>15} {'Cache Misses/Comp':>20} {'L1 Misses/Comp':>18}")
-    print("-" * 70)
-    for mode, result in results.items():
-        if result.total_distance_computations > 0:
-            cycles_per = result.perf_metrics.cycles / result.total_distance_computations
-            cache_miss_per = result.perf_metrics.cache_misses / result.total_distance_computations
-            l1_miss_per = result.perf_metrics.l1_dcache_load_misses / result.total_distance_computations
-            print(f"{mode:<15} {cycles_per:>15.2f} {cache_miss_per:>20.4f} {l1_miss_per:>18.4f}")
+    print(f"{'Cycles/Comp':>15} {'Cache Misses/Comp':>20} {'L1 Misses/Comp':>18}")
+    print("-" * 55)
+    if result.total_distance_computations > 0:
+        cycles_per = result.perf_metrics.cycles / result.total_distance_computations
+        cache_miss_per = result.perf_metrics.cache_misses / result.total_distance_computations
+        l1_miss_per = result.perf_metrics.l1_dcache_load_misses / result.total_distance_computations
+        print(f"{cycles_per:>15.2f} {cache_miss_per:>20.4f} {l1_miss_per:>18.4f}")
     
     print("\n### Per-Query Metrics ###")
-    for mode, result in results.items():
-        if result.num_queries > 0:
-            avg_comps = result.total_distance_computations / result.num_queries
-            avg_time = result.total_search_time_ms / result.num_queries
-            print(f"{mode}: {avg_comps:.1f} comps/query, {avg_time:.3f} ms/query")
+    if result.num_queries > 0:
+        avg_comps = result.total_distance_computations / result.num_queries
+        avg_time = result.total_search_time_ms / result.num_queries
+        print(f"{avg_comps:.1f} comps/query, {avg_time:.3f} ms/query")
     
-    print("\n### Hub vs Non-Hub Analysis ###")
-    normal = results.get('normal')
-    hub_only = results.get('hub_only')
-    nonhub_only = results.get('nonhub_only')
-    
-    if normal and hub_only and nonhub_only:
-        # Compare time per computation
-        if hub_only.total_distance_computations > 0:
-            hub_time_per_comp = hub_only.total_search_time_ms / hub_only.total_distance_computations
-            hub_cycles_per_comp = hub_only.perf_metrics.cycles / hub_only.total_distance_computations
-            print(f"Hub: {hub_time_per_comp * 1000:.3f} µs/comp, {hub_cycles_per_comp:.1f} cycles/comp, IPC={hub_only.perf_metrics.ipc:.3f}")
-        
-        if nonhub_only.total_distance_computations > 0:
-            nonhub_time_per_comp = nonhub_only.total_search_time_ms / nonhub_only.total_distance_computations
-            nonhub_cycles_per_comp = nonhub_only.perf_metrics.cycles / nonhub_only.total_distance_computations
-            print(f"Non-hub: {nonhub_time_per_comp * 1000:.3f} µs/comp, {nonhub_cycles_per_comp:.1f} cycles/comp, IPC={nonhub_only.perf_metrics.ipc:.3f}")
-        
-        if hub_only.total_distance_computations > 0 and nonhub_only.total_distance_computations > 0:
-            time_ratio = (hub_only.total_search_time_ms / hub_only.total_distance_computations) / \
-                    (nonhub_only.total_search_time_ms / nonhub_only.total_distance_computations)
-            cycles_ratio = (hub_only.perf_metrics.cycles / hub_only.total_distance_computations) / \
-                          (nonhub_only.perf_metrics.cycles / nonhub_only.total_distance_computations)
-            print(f"Hub/Non-hub ratios: time={time_ratio:.2f}x, cycles={cycles_ratio:.2f}x")
+    print("\n### Hub vs Non-Hub Breakdown ###")
+    total_comps = result.hub_distance_computations + result.nonhub_distance_computations
+    if total_comps > 0:
+        hub_pct = result.hub_distance_computations / total_comps * 100
+        nonhub_pct = result.nonhub_distance_computations / total_comps * 100
+        print(f"Hub computations: {result.hub_distance_computations:,} ({hub_pct:.1f}%)")
+        print(f"Non-hub computations: {result.nonhub_distance_computations:,} ({nonhub_pct:.1f}%)")
     
     print("=" * 80 + "\n")
 
 
-def save_results(results: Dict[str, ProfilingResult], dataset_name: str, output_path: str):
+def save_results(result: ProfilingResult, dataset_name: str, output_path: str):
     """Save profiling results to JSON file."""
     os.makedirs(output_path, exist_ok=True)
+    
+    pm = result.perf_metrics
+    total_comps = result.hub_distance_computations + result.nonhub_distance_computations
+    hub_pct = result.hub_distance_computations / total_comps * 100 if total_comps > 0 else 0
+    nonhub_pct = result.nonhub_distance_computations / total_comps * 100 if total_comps > 0 else 0
     
     output_data = {
         'dataset': dataset_name,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'results': {}
-    }
-    
-    for mode, result in results.items():
-        pm = result.perf_metrics
-        output_data['results'][mode] = {
-            'total_distance_computations': result.total_distance_computations,
-            'hub_distance_computations': result.hub_distance_computations,
-            'nonhub_distance_computations': result.nonhub_distance_computations,
+        'distance_computations': {
+            'total': result.total_distance_computations,
+            'hub': result.hub_distance_computations,
+            'nonhub': result.nonhub_distance_computations,
+            'hub_percentage': hub_pct,
+            'nonhub_percentage': nonhub_pct
+        },
+        'timing': {
             'total_search_time_ms': result.total_search_time_ms,
             'num_queries': result.num_queries,
-            'perf_metrics': {
-                'cycles': pm.cycles,
-                'instructions': pm.instructions,
-                'IPC': pm.ipc,
-                'cache_miss_rate': pm.cache_miss_rate,
-                'l1_miss_rate': pm.l1_miss_rate
-            }
+            'avg_time_per_query_ms': result.total_search_time_ms / result.num_queries if result.num_queries > 0 else 0,
+            'avg_comps_per_query': result.total_distance_computations / result.num_queries if result.num_queries > 0 else 0
+        },
+        'perf_metrics': {
+            'cycles': pm.cycles,
+            'instructions': pm.instructions,
+            'IPC': pm.ipc,
+            'cache_miss_rate': pm.cache_miss_rate,
+            'l1_miss_rate': pm.l1_miss_rate,
+            'cycles_per_computation': pm.cycles / result.total_distance_computations if result.total_distance_computations > 0 else 0,
+            'cache_misses_per_computation': pm.cache_misses / result.total_distance_computations if result.total_distance_computations > 0 else 0
         }
+    }
     
     filepath = os.path.join(output_path, f"{dataset_name}_hub_profile.json")
     with open(filepath, 'w') as f:
@@ -800,7 +773,7 @@ def main():
     logging.info(f"Queries: {len(queries)}")
     
     # Run profiling
-    results = run_full_profiling(
+    result = run_full_profiling(
         dataset_name=dataset_name,
         train_data=train_data,
         queries=queries,
@@ -814,8 +787,8 @@ def main():
     )
     
     # Print and save results
-    print_profiling_summary(results, dataset_name)
-    save_results(results, dataset_name, args.output_path)
+    print_profiling_summary(result, dataset_name)
+    save_results(result, dataset_name, args.output_path)
 
 
 if __name__ == "__main__":
