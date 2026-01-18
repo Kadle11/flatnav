@@ -41,10 +41,25 @@ RUN apt-get update -y \
         g++ \
         apt-utils \
         ninja-build \
-        linux-perf \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /tmp/*
+
+# Install perf separately (kernel-version specific)
+# Debian packages perf as linux-perf-<version>, find and symlink it
+RUN apt-get update && \
+    KERNEL_VERSION=$(uname -r) && \
+    apt-get install -y linux-perf-${KERNEL_VERSION} || \
+    apt-get install -y linux-perf || \
+    echo "Warning: Could not install perf" && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Create symlink from versioned perf to /usr/bin/perf
+    PERF_BIN=$(find /usr/bin -name 'perf_*' -type f 2>/dev/null | head -1) && \
+    if [ -n "$PERF_BIN" ]; then \
+        ln -sf "$PERF_BIN" /usr/bin/perf; \
+        echo "Installed perf: $(perf --version 2>&1 || echo 'perf binary found')"; \
+    fi
 
 # Install CMake 3.21+ (required by python-bindings)
 RUN wget -q https://github.com/Kitware/CMake/releases/download/v3.27.7/cmake-3.27.7-linux-x86_64.sh \

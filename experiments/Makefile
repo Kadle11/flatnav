@@ -642,6 +642,9 @@ profile-hub-compute:
 		--num-node-links 32 \
 		--hub-percentile 90
 
+test-stats:
+	poetry run python /root/flatnavlib/test_stats_collection.py
+
 plot-results:
 	poetry run python plot_stats_test_results.py
 

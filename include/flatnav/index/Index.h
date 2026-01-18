@@ -275,6 +275,15 @@ class Index {
         _hub_nodes[hub_node] = true;  
       }
   }
+  
+  // Debug method to count how many nodes are marked as hubs
+  uint64_t countHubNodes() const {
+      uint64_t count = 0;
+      for (uint32_t i = 0; i < _cur_num_nodes; i++) {
+          if (_hub_nodes[i]) count++;
+      }
+      return count;
+  }
 
   std::vector<std::vector<bool>> getVisitedNodesSequence() {
     return _visited_nodes_sequence;
@@ -584,6 +593,10 @@ class Index {
     uint64_t mem_size = static_cast<uint64_t>(index->_node_size_bytes) * static_cast<uint64_t>(index->_max_node_count);
 
     index->_index_memory = new char[mem_size];
+    
+    // Allocate and initialize hub_nodes array (not serialized, set at runtime)
+    index->_hub_nodes = new bool[index->_max_node_count];
+    std::fill_n(index->_hub_nodes, index->_max_node_count, false);
 
     // 3. Deserialize content into allocated memory
     archive(cereal::binary_data(index->_index_memory, mem_size));
@@ -612,6 +625,14 @@ class Index {
     if (_num_threads == 1) {
       _visited_set_pool->setPoolSize(1);
     }
+  }
+
+  inline void setCollectStats(bool collect_stats) {
+    _collect_stats = collect_stats;
+  }
+
+  inline bool getCollectStats() const {
+    return _collect_stats;
   }
 
 
@@ -871,7 +892,8 @@ class Index {
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
         // Track hub vs non-hub distance computations for profiling
-        if (_hub_nodes[neighbor_node_id]) {
+        bool is_hub = _hub_nodes[neighbor_node_id];
+        if (is_hub) {
           _hub_distance_computations.fetch_add(1);
         } else {
           _nonhub_distance_computations.fetch_add(1);

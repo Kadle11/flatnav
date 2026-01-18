@@ -275,9 +275,7 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
   }
 
   uint64_t getQueryDistanceComputations() const {
-    auto distance_computations = _index->distanceComputations();
-    _index->resetStats();
-    return distance_computations;
+    return _index->distanceComputations();
   }
 
   // Hub profiling methods
@@ -303,12 +301,20 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     }
   }
 
+  void setCollectStats(bool collect_stats) {
+    _index->setCollectStats(collect_stats);
+  }
+
   void buildGraphLinks(const std::string& mtx_filename) {
     _index->buildGraphLinks(/* mtx_filename = */ mtx_filename);
   }
 
   void setHubNodes(const std::vector<uint32_t> &hub_nodes) {
     _index->setHubNodeFlags(hub_nodes);
+  }
+  
+  uint64_t countHubNodes() {
+    return _index->countHubNodes();
   }
 
   std::vector<std::vector<bool>> getVisitedNodesSequence() {
@@ -519,7 +525,11 @@ void bindSpecialization(py::module_& index_submodule) {
            REORDER_DOCSTRING)
       .def("set_num_threads", &IndexType::setNumThreads, py::arg("num_threads"),
            SET_NUM_THREADS_DOCSTRING)
+      .def("set_collect_stats", &IndexType::setCollectStats, py::arg("collect_stats"),
+           "Enable or disable statistics collection")
       .def("set_hub_nodes", &IndexType::setHubNodes, py::arg("hub_nodes"))
+      .def("count_hub_nodes", &IndexType::countHubNodes,
+           "Count how many nodes are marked as hubs (for debugging)")
       .def("get_visited_nodes_sequence", &IndexType::getVisitedNodesSequence)
       .def_static("load_index", &IndexType::loadIndex, py::arg("filename"),
                   LOAD_INDEX_DOCSTRING)

@@ -175,13 +175,45 @@ def get_perf_events() -> List[str]:
     ]
 
 
-def check_perf_available() -> bool:
-    """Check if perf tool is available."""
+def check_perf_available() -> Tuple[bool, str]:
+    """
+    Check if perf tool is available and usable.
+    
+    Returns:
+        (is_available, message)
+    """
     try:
         result = subprocess.run(['perf', '--version'], capture_output=True, text=True)
-        return result.returncode == 0
+        if result.returncode != 0:
+            return False, "perf command not found"
+        
+        # Check perf_event_paranoid level
+        try:
+            with open('/proc/sys/kernel/perf_event_paranoid', 'r') as f:
+                paranoid_level = int(f.read().strip())
+                
+            if paranoid_level > 2:
+                return False, (
+                    f"perf_event_paranoid={paranoid_level} is too restrictive. "
+                    f"Run: sudo sysctl -w kernel.perf_event_paranoid=1 (or -1 for full access)"
+                )
+            elif paranoid_level > 0:
+                return True, f"perf available with restricted access (paranoid={paranoid_level})"
+            else:
+                return True, f"perf available with full access (paranoid={paranoid_level})"
+        except:
+            # If we can't read paranoid level, try running perf stat anyway
+            test_result = subprocess.run(
+                ['perf', 'stat', '-e', 'cycles', '--', 'ls'],
+                capture_output=True, text=True
+            )
+            if test_result.returncode == 0:
+                return True, "perf available (paranoid level unknown)"
+            else:
+                return False, f"perf test failed: {test_result.stderr[:200]}"
+                
     except FileNotFoundError:
-        return False
+        return False, "perf command not installed"
 
 
 def select_hub_nodes(node_access_counts: Dict[int, int], percentile: float = 90) -> List[int]:
@@ -268,6 +300,8 @@ def run_profiling_pass(
     ef_search: int,
     search_mode: int,
     mode_name: str,
+    hub_nodes: List[int],
+    distance_type: str,
     use_perf: bool = True,
 ) -> ProfilingResult:
     """
@@ -296,33 +330,155 @@ def run_profiling_pass(
     
     logging.info(f"Running {mode_name} pass with {result.num_queries} queries...")
     
-    if use_perf and check_perf_available():
-        # Run with perf stat
-        perf_events = get_perf_events()
-        
-        # Create a temporary script to run the search
+    perf_available, perf_msg = check_perf_available()
+    if use_perf and not perf_available:
+        logging.warning(f"perf requested but not available: {perf_msg}")
+        logging.warning("Falling back to software-only metrics")
+        use_perf = False
+    elif use_perf:
+        logging.info(f"Using perf: {perf_msg}")
+    
+    if use_perf:
+        # Create a temporary script that will be wrapped by perf
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
             script_path = f.name
-            # Note: We can't easily pickle the index, so we just time the search
-            # and get perf metrics from the subprocess
+            # Write a self-contained search script
+            # Determine the correct index class based on distance type
+            if distance_type == 'l2':
+                index_class = 'IndexL2Float'
+            else:
+                index_class = 'IndexIPFloat'
+            
+            f.write(f"""#!/usr/bin/env python3
+import sys
+sys.path.insert(0, '{Path(__file__).parent}')
+import numpy as np
+import flatnav.index
+
+# Load the serialized index using the correct class
+IndexClass = getattr(flatnav.index, '{index_class}')
+index = IndexClass.load_index('{tempfile.gettempdir()}/profiling_index.flatnav')
+queries = np.load('{tempfile.gettempdir()}/profiling_queries.npy')
+hub_nodes = np.load('{tempfile.gettempdir()}/profiling_hub_nodes.npy').tolist()
+
+# Debug output
+print(f"DEBUG: Loaded {{len(hub_nodes)}} hub nodes", file=sys.stderr)
+print(f"DEBUG: Loaded {{len(queries)}} queries", file=sys.stderr)
+sys.stderr.flush()
+
+# Enable stats collection (not serialized with index)
+index.set_collect_stats(True)
+
+# Set hub nodes before running searches
+print("DEBUG: About to set hub nodes...", file=sys.stderr)
+sys.stderr.flush()
+index.set_hub_nodes(hub_nodes)
+hub_count = index.count_hub_nodes()
+print(f"DEBUG: Set hub nodes, count_hub_nodes()={{hub_count}}", file=sys.stderr)
+sys.stderr.flush()
+
+print("DEBUG: About to set search mode...", file=sys.stderr)
+sys.stderr.flush()
+index.set_search_mode({search_mode})
+print("DEBUG: Set search mode", file=sys.stderr)
+sys.stderr.flush()
+
+print("DEBUG: About to reset stats...", file=sys.stderr)
+sys.stderr.flush()
+index.reset_stats()
+print("DEBUG: Reset stats", file=sys.stderr)
+sys.stderr.flush()
+
+index.set_num_threads(1)
+
+print(f"DEBUG: Starting search with mode={search_mode}", file=sys.stderr)
+sys.stderr.flush()
+
+failed_count = 0
+for i, query in enumerate(queries):
+    try:
+        _ = index.search_single(query, {k}, {ef_search})
+    except RuntimeError as e:
+        failed_count += 1
+        if failed_count <= 5:
+            print(f"DEBUG: Query {{i}} failed: {{e}}", file=sys.stderr)
+        continue
+
+print(f"DEBUG: Finished search loop, failed_count={{failed_count}}", file=sys.stderr)
+sys.stderr.flush()
+
+try:
+    total_dist = index.get_query_distance_computations()
+    hub_dist = index.get_hub_distance_computations()
+    nonhub_dist = index.get_nonhub_distance_computations()
+    print(f"DEBUG: Stats: total={{total_dist}}, hub={{hub_dist}}, nonhub={{nonhub_dist}}", file=sys.stderr)
+except Exception as e:
+    print(f"DEBUG: Error getting stats: {{e}}", file=sys.stderr)
+    total_dist = 0
+    hub_dist = 0
+    nonhub_dist = 0
+
+# Print stats for parent process to parse
+print(f"FAILED:{{failed_count}}")
+print(f"TOTAL_DIST_COMPS:{{total_dist}}")
+print(f"HUB_DIST_COMPS:{{hub_dist}}")
+print(f"NONHUB_DIST_COMPS:{{nonhub_dist}}")
+""")
         
-        # For now, run search directly and just measure time
-        # TODO: Implement proper subprocess-based perf measurement
+        # Save index, queries, and hub_nodes to temp files
+        index_path = f'{tempfile.gettempdir()}/profiling_index.flatnav'
+        queries_path = f'{tempfile.gettempdir()}/profiling_queries.npy'
+        hub_nodes_path = f'{tempfile.gettempdir()}/profiling_hub_nodes.npy'
+        index.save(index_path)
+        np.save(queries_path, queries)
+        np.save(hub_nodes_path, np.array(hub_nodes, dtype=np.uint32))
+        
+        # Run with perf stat
+        perf_events = ','.join(get_perf_events())
+        perf_cmd = [
+            'perf', 'stat',
+            '-e', perf_events,
+            '-x', ',',  # CSV output
+            'python3', script_path
+        ]
+        
         start_time = time.perf_counter()
-        failed_queries = 0
-        for i, query in enumerate(queries):
-            try:
-                _ = index.search_single(query, k, ef_search)
-            except RuntimeError as e:
-                # In HUB_ONLY or NONHUB_ONLY modes, we may not find k neighbors
-                failed_queries += 1
-                continue
+        proc_result = subprocess.run(perf_cmd, capture_output=True, text=True)
         end_time = time.perf_counter()
+        
+        result.total_search_time_ms = (end_time - start_time) * 1000
+        
+        # Log subprocess output for debugging - ALWAYS show this
+        logging.info(f"  Subprocess return code: {proc_result.returncode}")
+        logging.info(f"  Subprocess stdout (first 500): {proc_result.stdout[:500] if proc_result.stdout else 'EMPTY'}")
+        logging.info(f"  Subprocess stderr (first 500): {proc_result.stderr[:500] if proc_result.stderr else 'EMPTY'}")
+        
+        # Parse perf output from stderr
+        result.perf_metrics = parse_perf_output(proc_result.stderr)
+        
+        # Parse stats from stdout
+        failed_queries = 0
+        for line in proc_result.stdout.split('\n'):
+            if line.startswith('FAILED:'):
+                failed_queries = int(line.split(':')[1])
+            elif line.startswith('TOTAL_DIST_COMPS:'):
+                result.total_distance_computations = int(line.split(':')[1])
+            elif line.startswith('HUB_DIST_COMPS:'):
+                result.hub_distance_computations = int(line.split(':')[1])
+            elif line.startswith('NONHUB_DIST_COMPS:'):
+                result.nonhub_distance_computations = int(line.split(':')[1])
+        
+        # Cleanup
+        try:
+            os.unlink(script_path)
+            os.unlink(index_path)
+            os.unlink(queries_path)
+            os.unlink(hub_nodes_path)
+        except:
+            pass
         
         if failed_queries > 0:
             logging.warning(f"  {failed_queries} queries failed to return {k} results (expected in filtered modes)")
-        
-        result.total_search_time_ms = (end_time - start_time) * 1000
     else:
         # Run without perf
         start_time = time.perf_counter()
@@ -341,11 +497,12 @@ def run_profiling_pass(
             logging.warning(f"  {failed_queries} queries failed to return {k} results (expected in filtered modes)")
         
         result.total_search_time_ms = (end_time - start_time) * 1000
-    
-    # Get software counters
-    result.hub_distance_computations = index.get_hub_distance_computations()
-    result.nonhub_distance_computations = index.get_nonhub_distance_computations()
-    result.total_distance_computations = result.hub_distance_computations + result.nonhub_distance_computations
+        
+        # Only get software counters from parent index when NOT using perf subprocess
+        # (when using perf, we already parsed them from subprocess stdout above)
+        result.hub_distance_computations = index.get_hub_distance_computations()
+        result.nonhub_distance_computations = index.get_nonhub_distance_computations()
+        result.total_distance_computations = result.hub_distance_computations + result.nonhub_distance_computations
     
     logging.info(f"  Total distance computations: {result.total_distance_computations:,}")
     logging.info(f"  Hub distance computations: {result.hub_distance_computations:,}")
@@ -403,19 +560,19 @@ def run_full_profiling(
     # Pass 1: Normal search (baseline)
     results['normal'] = run_profiling_pass(
         index, queries, ground_truth, k, ef_search,
-        SEARCH_MODE_NORMAL, "normal"
+        SEARCH_MODE_NORMAL, "normal", hub_nodes, distance_type, use_perf=True
     )
     
     # Pass 2: Hub-only search
     results['hub_only'] = run_profiling_pass(
         index, queries, ground_truth, k, ef_search,
-        SEARCH_MODE_HUB_ONLY, "hub_only"
+        SEARCH_MODE_HUB_ONLY, "hub_only", hub_nodes, distance_type, use_perf=True
     )
     
     # Pass 3: Non-hub-only search
     results['nonhub_only'] = run_profiling_pass(
         index, queries, ground_truth, k, ef_search,
-        SEARCH_MODE_NONHUB_ONLY, "nonhub_only"
+        SEARCH_MODE_NONHUB_ONLY, "nonhub_only", hub_nodes, distance_type, use_perf=True
     )
     
     # Cleanup
@@ -443,6 +600,42 @@ def print_profiling_summary(results: Dict[str, ProfilingResult], dataset_name: s
               f"{result.nonhub_distance_computations:>15,} "
               f"{result.total_search_time_ms:>12.2f}")
     
+    print("\n### Hardware Metrics (perf) ###")
+    
+    # Check if any perf metrics were collected
+    has_perf_data = any(r.perf_metrics.cycles > 0 for r in results.values())
+    
+    if not has_perf_data:
+        print("⚠️  WARNING: No hardware metrics collected!")
+        print("   Perf counters are not available. This can happen due to:")
+        print("   1. perf_event_paranoid level too high (current: check /proc/sys/kernel/perf_event_paranoid)")
+        print("   2. Running in a container/VM without perf access")
+        print("   3. Kernel compiled without perf support")
+        print("\n   To enable perf on the host:")
+        print("   sudo sysctl -w kernel.perf_event_paranoid=1")
+        print("   (or -1 for full access, or 2 for user-space only)")
+        print("\n   Then rebuild and rerun the Docker container.")
+        print("\n   Software-only metrics (timing, computation counts) are still valid below.\n")
+    
+    print(f"{'Mode':<15} {'Cycles':>15} {'Instructions':>15} {'IPC':>8} {'Cache Miss %':>12} {'L1 Miss %':>10}")
+    print("-" * 85)
+    for mode, result in results.items():
+        pm = result.perf_metrics
+        cache_miss_pct = pm.cache_miss_rate * 100 if pm.cache_miss_rate > 0 else 0
+        l1_miss_pct = pm.l1_miss_rate * 100 if pm.l1_miss_rate > 0 else 0
+        print(f"{mode:<15} {pm.cycles:>15,} {pm.instructions:>15,} "
+              f"{pm.ipc:>8.3f} {cache_miss_pct:>11.2f}% {l1_miss_pct:>9.2f}%")
+    
+    print("\n### Per-Distance-Computation Hardware Metrics ###")
+    print(f"{'Mode':<15} {'Cycles/Comp':>15} {'Cache Misses/Comp':>20} {'L1 Misses/Comp':>18}")
+    print("-" * 70)
+    for mode, result in results.items():
+        if result.total_distance_computations > 0:
+            cycles_per = result.perf_metrics.cycles / result.total_distance_computations
+            cache_miss_per = result.perf_metrics.cache_misses / result.total_distance_computations
+            l1_miss_per = result.perf_metrics.l1_dcache_load_misses / result.total_distance_computations
+            print(f"{mode:<15} {cycles_per:>15.2f} {cache_miss_per:>20.4f} {l1_miss_per:>18.4f}")
+    
     print("\n### Per-Query Metrics ###")
     for mode, result in results.items():
         if result.num_queries > 0:
@@ -459,16 +652,20 @@ def print_profiling_summary(results: Dict[str, ProfilingResult], dataset_name: s
         # Compare time per computation
         if hub_only.total_distance_computations > 0:
             hub_time_per_comp = hub_only.total_search_time_ms / hub_only.total_distance_computations
-            print(f"Hub time per computation: {hub_time_per_comp * 1000:.3f} µs")
+            hub_cycles_per_comp = hub_only.perf_metrics.cycles / hub_only.total_distance_computations
+            print(f"Hub: {hub_time_per_comp * 1000:.3f} µs/comp, {hub_cycles_per_comp:.1f} cycles/comp, IPC={hub_only.perf_metrics.ipc:.3f}")
         
         if nonhub_only.total_distance_computations > 0:
             nonhub_time_per_comp = nonhub_only.total_search_time_ms / nonhub_only.total_distance_computations
-            print(f"Non-hub time per computation: {nonhub_time_per_comp * 1000:.3f} µs")
+            nonhub_cycles_per_comp = nonhub_only.perf_metrics.cycles / nonhub_only.total_distance_computations
+            print(f"Non-hub: {nonhub_time_per_comp * 1000:.3f} µs/comp, {nonhub_cycles_per_comp:.1f} cycles/comp, IPC={nonhub_only.perf_metrics.ipc:.3f}")
         
         if hub_only.total_distance_computations > 0 and nonhub_only.total_distance_computations > 0:
-            ratio = (hub_only.total_search_time_ms / hub_only.total_distance_computations) / \
+            time_ratio = (hub_only.total_search_time_ms / hub_only.total_distance_computations) / \
                     (nonhub_only.total_search_time_ms / nonhub_only.total_distance_computations)
-            print(f"Hub/Non-hub time ratio: {ratio:.2f}x")
+            cycles_ratio = (hub_only.perf_metrics.cycles / hub_only.total_distance_computations) / \
+                          (nonhub_only.perf_metrics.cycles / nonhub_only.total_distance_computations)
+            print(f"Hub/Non-hub ratios: time={time_ratio:.2f}x, cycles={cycles_ratio:.2f}x")
     
     print("=" * 80 + "\n")
 
@@ -484,12 +681,20 @@ def save_results(results: Dict[str, ProfilingResult], dataset_name: str, output_
     }
     
     for mode, result in results.items():
+        pm = result.perf_metrics
         output_data['results'][mode] = {
             'total_distance_computations': result.total_distance_computations,
             'hub_distance_computations': result.hub_distance_computations,
             'nonhub_distance_computations': result.nonhub_distance_computations,
             'total_search_time_ms': result.total_search_time_ms,
             'num_queries': result.num_queries,
+            'perf_metrics': {
+                'cycles': pm.cycles,
+                'instructions': pm.instructions,
+                'IPC': pm.ipc,
+                'cache_miss_rate': pm.cache_miss_rate,
+                'l1_miss_rate': pm.l1_miss_rate
+            }
         }
     
     filepath = os.path.join(output_path, f"{dataset_name}_hub_profile.json")
