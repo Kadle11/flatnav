@@ -162,6 +162,42 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     return {distances_array, labels_array};
   }
 
+  // Search single query with node ID tracking for neighborhood profiling
+  template <typename data_type>
+  DistancesLabelsPair searchSingleWithNodeIDsImpl(
+      const py::array_t<data_type, py::array::c_style | py::array::forcecast>& query, int K, int ef_search,
+      int num_initializations = 100) {
+    if (query.ndim() != 1 || query.shape(0) != _dim) {
+      throw std::invalid_argument("Query has incorrect dimensions.");
+    }
+
+    std::vector<std::pair<float, label_t>> top_k = this->_index->searchWithNodeIDs(
+        (const void*)query.data(0), K, ef_search, num_initializations);
+
+    if (top_k.size() != K) {
+      throw std::runtime_error("Search did not return the expected number of results. Expected " +
+                               std::to_string(K) + " but got " + std::to_string(top_k.size()) + ".");
+    }
+
+    label_t* labels = new label_t[K];
+    float* distances = new float[K];
+
+    for (size_t i = 0; i < K; i++) {
+      distances[i] = top_k[i].first;
+      labels[i] = top_k[i].second;
+    }
+
+    py::capsule free_labels_when_done(labels, [](void* ptr) { delete (label_t*)ptr; });
+    py::capsule free_distances_when_done(distances, [](void* ptr) { delete (float*)ptr; });
+
+    py::array_t<label_t> labels_array =
+        py::array_t<label_t>({K}, {sizeof(label_t)}, labels, free_labels_when_done);
+    py::array_t<float> distances_array =
+        py::array_t<float>({K}, {sizeof(float)}, distances, free_distances_when_done);
+
+    return {distances_array, labels_array};
+  }
+
   template <typename data_type>
   DistancesLabelsPair searchImpl(
       const py::array_t<data_type, py::array::c_style | py::array::forcecast>& queries, int K, int ef_search,
@@ -321,6 +357,14 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     return _index->getVisitedNodesSequence();
   }
 
+  std::vector<std::vector<std::pair<uint32_t, bool>>> getVisitedNodesWithIDs() {
+    return _index->getVisitedNodesWithIDs();
+  }
+
+  void clearVisitedNodesWithIDs() {
+    _index->clearVisitedNodesWithIDs();
+  }
+
   std::vector<std::vector<uint32_t>> getGraphOutdegreeTable() {
     return _index->getGraphOutdegreeTable();
   }
@@ -395,6 +439,16 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
         data_type, query,
         [this](auto&& casted_query, int k, int ef, int num_init) {
           return this->searchSingleImpl(std::forward<decltype(casted_query)>(casted_query), k, ef, num_init);
+        },
+        K, ef_search, num_initializations);
+  }
+
+  DistancesLabelsPair searchSingleWithNodeIDs(const py::array& query, int K, int ef_search, int num_initializations) {
+    auto data_type = _index->getDataType();
+    return cast_and_call(
+        data_type, query,
+        [this](auto&& casted_query, int k, int ef, int num_init) {
+          return this->searchSingleWithNodeIDsImpl(std::forward<decltype(casted_query)>(casted_query), k, ef, num_init);
         },
         K, ef_search, num_initializations);
   }
@@ -531,6 +585,17 @@ void bindSpecialization(py::module_& index_submodule) {
       .def("count_hub_nodes", &IndexType::countHubNodes,
            "Count how many nodes are marked as hubs (for debugging)")
       .def("get_visited_nodes_sequence", &IndexType::getVisitedNodesSequence)
+      .def("get_visited_nodes_with_ids", &IndexType::getVisitedNodesWithIDs,
+           "Returns list of (node_id, is_hub) pairs for each query's visited sequence")
+      .def("clear_visited_nodes_with_ids", &IndexType::clearVisitedNodesWithIDs,
+           "Clear the accumulated visited nodes with IDs data")
+      .def(
+          "search_single_with_node_ids",
+          [](IndexType& index, const py::array& query, int K, int ef_search, int num_initializations = 100) {
+            return index.searchSingleWithNodeIDs(query, K, ef_search, num_initializations);
+          },
+          py::arg("query"), py::arg("K"), py::arg("ef_search"), py::arg("num_initializations") = 100,
+          "Search for K nearest neighbors while tracking visited node IDs for neighborhood profiling")
       .def_static("load_index", &IndexType::loadIndex, py::arg("filename"),
                   LOAD_INDEX_DOCSTRING)
       .def_property_readonly("max_edges_per_node",

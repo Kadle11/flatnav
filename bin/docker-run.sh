@@ -87,6 +87,7 @@ fi
 mkdir -p $METRICS_DIR
 mkdir -p $(pwd)/node-access-distributions
 mkdir -p $(pwd)/edge-lengths
+mkdir -p $(pwd)/neighborhood-tests
 
 # Clean up existing docker images matching "flatnav" if any 
 # docker rmi -f $(docker images --filter=reference="flatnav" -q) &> /dev/null || true
@@ -117,5 +118,6 @@ docker run \
         --volume ${METRICS_DIR}:/root/metrics \
         --volume $(pwd)/node-access-distributions:/root/node-access-distributions \
         --volume $(pwd)/edge-lengths:/root/edge-lengths \
+        --volume $(pwd)/neighborhood-tests:/root/data/neighborhood-tests \
         --rm flatnav:$TAG_NAME \
         make $1

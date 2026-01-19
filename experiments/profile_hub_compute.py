@@ -47,6 +47,31 @@ ROOT_DATASET_PATH = os.getenv("ROOT_DATASET_PATH", "/root/data/hubness/data")
 # Output directory for profiling results
 PROFILE_OUTPUT_PATH = os.getenv("PROFILE_OUTPUT_PATH", "/root/metrics/hub_profiling")
 
+SYNTHETIC_DATASETS = [
+    "normal-16-angular",
+    "normal-16-euclidean",
+    "normal-32-angular",
+    "normal-32-euclidean",
+    "normal-64-angular",
+    "normal-64-euclidean",
+    "normal-128-angular",
+    "normal-128-euclidean",
+    # "normal-256-angular",
+    # "normal-256-euclidean",
+    # "normal-1024-angular",
+    # "normal-1024-euclidean",
+    "normal-1536-angular",
+    "normal-1536-euclidean",
+]
+
+ANN_DATASETS = [
+    "glove-100-angular",
+    "nytimes-256-angular",
+    "gist-960-euclidean",
+    # "yandex-deep-10m-euclidean",
+    # "spacev-10m-euclidean",
+]
+
 
 @dataclass
 class PerfMetrics:
@@ -542,7 +567,7 @@ def run_full_profiling(
     
     for query in queries:
         try:
-            _ = index.search_single(query, k, ef_search)
+            _ = index.search_single(query, k, ef_search, num_initializations=100)
         except RuntimeError:
             # Should not happen in NORMAL mode, but handle gracefully
             continue
@@ -713,7 +738,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ef-search",
         type=int,
-        default=200,
+        default=100,
         help="ef_search parameter"
     )
     
@@ -751,44 +776,45 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     
-    # Load dataset
-    dataset_name = args.dataset
-    metric = get_metric_from_dataset_name(dataset_name)
-    base_path = os.path.join(args.root_dataset_path, dataset_name)
+    for dataset_name in SYNTHETIC_DATASETS + ANN_DATASETS:
     
-    if not os.path.exists(base_path):
-        logging.error(f"Dataset path not found: {base_path}")
-        sys.exit(1)
-    
-    logging.info(f"Loading dataset {dataset_name} from {base_path}")
-    train_data, queries, ground_truth = load_dataset(base_path, dataset_name)
-    
-    # Limit queries if specified
-    if args.num_queries and args.num_queries < len(queries):
-        queries = queries[:args.num_queries]
-        ground_truth = ground_truth[:args.num_queries]
-        logging.info(f"Limited to {len(queries)} queries")
-    
-    logging.info(f"Dataset: {train_data.shape[0]} vectors, {train_data.shape[1]} dimensions")
-    logging.info(f"Queries: {len(queries)}")
-    
-    # Run profiling
-    result = run_full_profiling(
-        dataset_name=dataset_name,
-        train_data=train_data,
-        queries=queries,
-        ground_truth=ground_truth,
-        distance_type=metric,
-        max_edges_per_node=args.num_node_links,
-        ef_construction=args.ef_construction,
-        ef_search=args.ef_search,
-        k=args.k,
-        hub_percentile=args.hub_percentile,
-    )
-    
-    # Print and save results
-    print_profiling_summary(result, dataset_name)
-    save_results(result, dataset_name, args.output_path)
+        # Load dataset
+        metric = get_metric_from_dataset_name(dataset_name)
+        base_path = os.path.join(args.root_dataset_path, dataset_name)
+        
+        if not os.path.exists(base_path):
+            logging.error(f"Dataset path not found: {base_path}")
+            sys.exit(1)
+        
+        logging.info(f"Loading dataset {dataset_name} from {base_path}")
+        train_data, queries, ground_truth = load_dataset(base_path, dataset_name)
+        
+        # Limit queries if specified
+        if args.num_queries and args.num_queries < len(queries):
+            queries = queries[:args.num_queries]
+            ground_truth = ground_truth[:args.num_queries]
+            logging.info(f"Limited to {len(queries)} queries")
+        
+        logging.info(f"Dataset: {train_data.shape[0]} vectors, {train_data.shape[1]} dimensions")
+        logging.info(f"Queries: {len(queries)}")
+        
+        # Run profiling
+        result = run_full_profiling(
+            dataset_name=dataset_name,
+            train_data=train_data,
+            queries=queries,
+            ground_truth=ground_truth,
+            distance_type=metric,
+            max_edges_per_node=args.num_node_links,
+            ef_construction=args.ef_construction,
+            ef_search=args.ef_search,
+            k=args.k,
+            hub_percentile=args.hub_percentile,
+        )
+        
+        # Print and save results
+        print_profiling_summary(result, dataset_name)
+        save_results(result, dataset_name, args.output_path)
 
 
 if __name__ == "__main__":

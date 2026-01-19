@@ -97,6 +97,11 @@ class Index {
   // whether a visited node is a hub node or not.
   std::vector<std::vector<bool>> _visited_nodes_sequence;
 
+  // Keep track of visited nodes with their IDs and hub status.
+  // Each inner vector stores (node_id, is_hub) pairs in visitation order.
+  // Used for neighborhood profiling analysis.
+  std::vector<std::vector<std::pair<uint32_t, bool>>> _visited_nodes_with_ids;
+
   bool* _hub_nodes; // A boolean array to keep track of hub nodes.
   // If a node is a hub, then _hub_nodes[node] = true, else false.
 
@@ -287,6 +292,21 @@ class Index {
 
   std::vector<std::vector<bool>> getVisitedNodesSequence() {
     return _visited_nodes_sequence;
+  }
+
+  /**
+   * @brief Get the sequence of visited nodes with their IDs and hub status.
+   * @return Vector of vectors, each containing (node_id, is_hub) pairs in visitation order.
+   */
+  std::vector<std::vector<std::pair<uint32_t, bool>>> getVisitedNodesWithIDs() {
+    return _visited_nodes_with_ids;
+  }
+
+  /**
+   * @brief Clear the accumulated visited nodes with IDs data.
+   */
+  void clearVisitedNodesWithIDs() {
+    _visited_nodes_with_ids.clear();
   }
 
 
@@ -512,6 +532,42 @@ class Index {
         beamSearch<true>(/* query = */ query,
                          /* entry_node = */ entry_node,
                          /* buffer_size = */ std::max(K, ef_search));
+    auto size = neighbors.size();
+    std::vector<dist_label_t> results;
+    results.reserve(size);
+    while (!neighbors.empty()) {
+      auto [distance, node_id] = neighbors.top();
+      auto label = *getNodeLabel(node_id);
+      results.emplace_back(distance, label);
+      neighbors.pop();
+    }
+    std::sort(results.begin(), results.end(),
+              [](const dist_label_t& left, const dist_label_t& right) { return left.first < right.first; });
+    if (results.size() > static_cast<size_t>(K)) {
+      results.resize(K);
+    }
+
+    return results;
+  }
+
+  /**
+   * @brief Search the index with node ID tracking for neighborhood profiling.
+   * Similar to search() but uses beamSearchWithNodeIDs to record visited node IDs.
+   * @param query The query vector.
+   * @param K The number of nearest neighbors to return.
+   * @param ef_search The search beam width.
+   * @param num_initializations The number of random initializations to use.
+   */
+  std::vector<dist_label_t> searchWithNodeIDs(const void* query, const int K, int ef_search,
+                                              int num_initializations = 100) {
+    node_id_t entry_node;
+    if (_use_random_initialization) {
+      entry_node = randomlyInitializeSearch(query, num_initializations);
+    } else {
+      entry_node = initializeSearch(query, num_initializations);
+    }
+    PriorityQueue neighbors =
+        beamSearchWithNodeIDs<true>(query, entry_node, std::max(K, ef_search));
     auto size = neighbors.size();
     std::vector<dist_label_t> results;
     results.reserve(size);
@@ -904,6 +960,154 @@ class Index {
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
         // query_visited_nodes_flags.push_back(_hub_nodes[neighbor_node_id]);
+#ifdef USE_SSE
+        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
+#endif
+        if (neighbors.size() > buffer_size) {
+          neighbors.pop();
+        }
+        if (!neighbors.empty()) {
+          max_dist = neighbors.top().first;
+        }
+      }
+    }
+  }
+
+  /**
+   * @brief Performs beam search with node ID tracking for neighborhood profiling.
+   * Similar to beamSearch but also records (node_id, is_hub) pairs for analysis.
+   *
+   * @param query               The query vector.
+   * @param entry_node          The node to start the search from.
+   * @param buffer_size         This is equivalent to `ef_search` in the HNSW
+   *
+   * @return PriorityQueue
+   */
+  template <bool is_search_stage = false>
+  PriorityQueue beamSearchWithNodeIDs(const void *query, const node_id_t entry_node,
+                                      const int buffer_size) {
+    PriorityQueue neighbors;
+    PriorityQueue candidates;
+
+    // Keep track of the nodes visited during the search with their IDs
+    std::vector<bool> query_visited_nodes_flags;
+    std::vector<std::pair<uint32_t, bool>> query_visited_nodes_with_ids;
+
+    auto *visited_set = _visited_set_pool->pollAvailableSet();
+    visited_set->clear();
+
+#ifdef USE_SSE
+    _mm_prefetch(getNodeData(entry_node), _MM_HINT_T0);
+#endif
+
+    float dist = _distance->distance(query, getNodeData(entry_node), true);
+
+    if (_collect_stats && is_search_stage) {
+      _distance_computations.fetch_add(1);
+      if (_hub_nodes[entry_node]) {
+        _hub_distance_computations.fetch_add(1);
+      } else {
+        _nonhub_distance_computations.fetch_add(1);
+      }
+    }
+
+    float max_dist = dist;
+    candidates.emplace(-dist, entry_node);
+    neighbors.emplace(dist, entry_node);
+    query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);
+    query_visited_nodes_with_ids.push_back({entry_node, _hub_nodes[entry_node]});
+    visited_set->insert(entry_node);
+
+    if (is_search_stage) {
+      _node_access_counts[entry_node]++;
+    }
+
+    while (!candidates.empty()) {
+      auto [distance, node] = candidates.top();
+
+      if (-distance > max_dist && neighbors.size() >= buffer_size) {
+        break;
+      }
+      candidates.pop();
+
+#ifdef USE_SSE
+      if (!candidates.empty()) {
+        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
+        visited_set->prefetch(candidates.top().second);
+      }
+#endif
+
+      processCandidateNodeWithIDs<is_search_stage>(
+          query, node, max_dist, buffer_size, visited_set,
+          neighbors, candidates, query_visited_nodes_flags,
+          query_visited_nodes_with_ids);
+    }
+
+    _visited_nodes_sequence.push_back(std::move(query_visited_nodes_flags));
+    _visited_nodes_with_ids.push_back(std::move(query_visited_nodes_with_ids));
+
+    _visited_set_pool->pushVisitedSet(visited_set);
+
+    return neighbors;
+  }
+
+  /**
+   * @brief Process candidate node with ID tracking for neighborhood profiling.
+   */
+  template <bool is_search_stage>
+  void processCandidateNodeWithIDs(const void *query, node_id_t &node, float &max_dist,
+                                   const int buffer_size, VisitedSet *visited_set,
+                                   PriorityQueue &neighbors, PriorityQueue &candidates,
+                                   std::vector<bool>& query_visited_nodes_flags,
+                                   std::vector<std::pair<uint32_t, bool>>& query_visited_nodes_with_ids) {
+    std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
+
+    node_id_t *neighbor_node_links = getNodeLinks(node);
+    query_visited_nodes_flags.push_back(_hub_nodes[node]);
+    query_visited_nodes_with_ids.push_back({node, _hub_nodes[node]});
+
+    for (uint32_t i = 0; i < _M; i++) {
+      node_id_t neighbor_node_id = neighbor_node_links[i];
+
+      if (_search_mode == SearchMode::HUB_ONLY && !_hub_nodes[neighbor_node_id]) {
+        continue;
+      }
+      if (_search_mode == SearchMode::NONHUB_ONLY && _hub_nodes[neighbor_node_id]) {
+        continue;
+      }
+
+      if (is_search_stage) {
+        _node_access_counts[neighbor_node_id]++;
+      }
+
+#ifdef USE_SSE
+      if (i != _M - 1) {
+        _mm_prefetch(getNodeData(neighbor_node_links[i + 1]), _MM_HINT_T0);
+        visited_set->prefetch(neighbor_node_links[i + 1]);
+      }
+#endif
+
+      bool neighbor_is_visited = visited_set->isVisited(neighbor_node_id);
+
+      if (neighbor_is_visited) {
+        continue;
+      }
+      visited_set->insert(neighbor_node_id);
+      float dist = _distance->distance(query, getNodeData(neighbor_node_id), true);
+
+      if (_collect_stats) {
+        _distance_computations.fetch_add(1);
+        bool is_hub = _hub_nodes[neighbor_node_id];
+        if (is_hub) {
+          _hub_distance_computations.fetch_add(1);
+        } else {
+          _nonhub_distance_computations.fetch_add(1);
+        }
+      }
+
+      if (neighbors.size() < buffer_size || dist < max_dist) {
+        candidates.emplace(-dist, neighbor_node_id);
+        neighbors.emplace(dist, neighbor_node_id);
 #ifdef USE_SSE
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
 #endif

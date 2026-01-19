@@ -635,12 +635,25 @@ plot-speed-test-results:
 # Profile hub vs non-hub compute and memory performance
 profile-hub-compute:
 	poetry run python profile_hub_compute.py \
-		--dataset nytimes-256-angular \
+		--dataset gist-960-euclidean \
 		--k 100 \
 		--ef-construction 100 \
-		--ef-search 200 \
+		--ef-search 100 \
 		--num-node-links 32 \
-		--hub-percentile 90
+		--hub-percentile 99
+
+# Profile neighborhood access patterns during search
+neighborhood-profile:
+	poetry run python neighborhood_profiler.py \
+		--hubness-percentile-threshold 99 \
+		--ef-construction 100 \
+		--ef-search 100
+
+# Plot neighborhood profiling results
+plot-neighborhood-results:
+	poetry run python plot_neighborhood_results.py \
+		--hubness-percentile 99 \
+		--num-bins 30
 
 test-stats:
 	poetry run python /root/flatnavlib/test_stats_collection.py
