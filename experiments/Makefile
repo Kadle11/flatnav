@@ -453,8 +453,8 @@ generate-datasets:
 	poetry run python generate-datasets.py \
 		--base-path /root/data \
 		--dataset-size 1010000 \
-		--num-queries 10000 \
-		--dimensions 1 2 4 8 16 32 64 128 1536 \
+		--num-queries 100000 \
+		--dimensions 64 128 256 512 \
 		--k 100
 
 # Generate hubness scores for each desired dataset
@@ -627,7 +627,7 @@ run-hypothesis-test:
 	poetry run python statistical_test.py
 
 speed-test:
-	poetry run python hubness_speed_test.py --hubness-percentile-threshold 99
+	poetry run python hubness_speed_test.py --hubness-percentile-threshold 99 --hub-selection-method degree
 
 plot-speed-test-results:
 	poetry run python plot_speed_test_results.py
@@ -637,10 +637,24 @@ profile-hub-compute:
 	poetry run python profile_hub_compute.py \
 		--dataset gist-960-euclidean \
 		--k 100 \
-		--ef-construction 100 \
-		--ef-search 100 \
+		--ef-construction 40 \
+		--ef-search 1000 \
 		--num-node-links 32 \
-		--hub-percentile 99
+		--hub-percentile 90 \
+		--hub-selection-method degree \
+		--num-queries 1000
+
+profile-hub-compute-extremes:
+	poetry run python profile_hub_compute.py \
+		--dataset gist-960-euclidean \
+		--k 100 \
+		--ef-construction 40 \
+		--ef-search 1000 \
+		--num-node-links 32 \
+		--hub-percentile 90 \
+		--hub-selection-method degree \
+		--num-queries 1000 \
+		--query-ratio-extremes
 
 # Profile neighborhood access patterns during search
 neighborhood-profile:

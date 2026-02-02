@@ -2,6 +2,7 @@ import time
 import json
 import hnswlib
 import numpy as np
+import sys
 from typing import Optional, Tuple, List, Dict, Union
 import numpy as np
 import os
@@ -199,10 +200,8 @@ def train_index(
             num_threads=num_build_threads,
         )
 
-        # Save index to "/root/data/hnsw_index_100m.bin"
+        # Save index to "/root/data/hnsw_index_100m.bin" and continue to compute metrics.
         hnsw_index.save_index("/root/data/hnsw_index_100m.bin")
-        exit(0)
-
         return hnsw_index
 
     if use_hnsw_base_layer:
@@ -669,5 +668,5 @@ def run_experiment():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     run_experiment()

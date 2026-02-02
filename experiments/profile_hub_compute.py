@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import random
 
 import numpy as np
 from typing import Any
@@ -42,32 +43,33 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 SEARCH_MODE_NORMAL = 0
 
 # Default dataset path
-ROOT_DATASET_PATH = os.getenv("ROOT_DATASET_PATH", "/root/data/hubness/data")
+ROOT_DATASET_PATH = os.getenv("ROOT_DATASET_PATH", "/root/data")
 
 # Output directory for profiling results
 PROFILE_OUTPUT_PATH = os.getenv("PROFILE_OUTPUT_PATH", "/root/metrics/hub_profiling")
 
 SYNTHETIC_DATASETS = [
-    "normal-16-angular",
-    "normal-16-euclidean",
-    "normal-32-angular",
-    "normal-32-euclidean",
-    "normal-64-angular",
+    # "normal-16-angular",
+    # "normal-16-euclidean",
+    # "normal-32-angular",
+    # "normal-32-euclidean",
+    # "normal-64-angular",
     "normal-64-euclidean",
-    "normal-128-angular",
+    # "normal-128-angular",
     "normal-128-euclidean",
     # "normal-256-angular",
-    # "normal-256-euclidean",
+    "normal-256-euclidean",
+    # "normal-512-euclidean",
     # "normal-1024-angular",
     # "normal-1024-euclidean",
-    "normal-1536-angular",
-    "normal-1536-euclidean",
+    # "normal-1536-angular",
+    # "normal-1536-euclidean",
 ]
 
 ANN_DATASETS = [
-    "glove-100-angular",
-    "nytimes-256-angular",
-    "gist-960-euclidean",
+    # "glove-100-angular",
+    # "nytimes-256-angular",
+    # "gist-960-euclidean",
     # "yandex-deep-10m-euclidean",
     # "spacev-10m-euclidean",
 ]
@@ -125,6 +127,13 @@ class ProfilingResult:
     # Per-computation derived metrics
     cycles_per_computation: float = 0.0
     cache_misses_per_computation: float = 0.0
+
+    # Degree stats for accessed nodes
+    accessed_avg_in_degree: float = 0.0
+    accessed_avg_out_degree: float = 0.0
+    
+    # Accuracy (fraction [0,1])
+    recall_at_k: float = 0.0
     
     def compute_per_computation_metrics(self):
         """Compute per-distance-computation metrics."""
@@ -265,6 +274,82 @@ def select_hub_nodes(node_access_counts: Dict[int, int], percentile: float = 90)
     return hub_nodes
 
 
+def select_hub_nodes_by_degree(index: Any, percentile: float = 90) -> Tuple[List[int], Dict[str, float]]:
+    """
+    Select hub nodes based on total graph degree (in-degree + out-degree) percentile.
+    This is query-INDEPENDENT - degree is a property of the graph structure only.
+    
+    Args:
+        index: FlatNav index
+        percentile: Percentile threshold (default 90 = top 10% highest degree nodes)
+    
+    Returns:
+        Tuple of (hub_nodes, degree_stats) where degree_stats contains avg in/out degrees for hubs and non-hubs
+    """
+    # Get the outdegree table: list of neighbor lists for each node
+    outdegree_table = index.get_graph_outdegree_table()
+    num_nodes = len(outdegree_table)
+    
+    # Calculate out-degrees
+    out_degrees = {node_id: len(neighbors) for node_id, neighbors in enumerate(outdegree_table)}
+    
+    # Calculate in-degrees by counting how many times each node appears as a neighbor
+    in_degrees = {node_id: 0 for node_id in range(num_nodes)}
+    for node_id, neighbors in enumerate(outdegree_table):
+        for neighbor_id in neighbors:
+            in_degrees[neighbor_id] += 1
+    
+    # Calculate total degree (in + out) for each node
+    total_degrees = {
+        node_id: in_degrees[node_id] + out_degrees[node_id]
+        for node_id in range(num_nodes)
+    }
+    
+    # Find threshold total degree
+    degree_values = list(total_degrees.values())
+    threshold = np.percentile(degree_values, percentile)
+    
+    # Select hub nodes with total degree >= threshold
+    hub_nodes = [
+        node_id for node_id, degree in total_degrees.items()
+        if degree >= threshold
+    ]
+    hub_nodes_set = set(hub_nodes)
+    
+    # Compute statistics
+    avg_in_degree = sum(in_degrees.values()) / num_nodes if num_nodes > 0 else 0
+    avg_out_degree = sum(out_degrees.values()) / num_nodes if num_nodes > 0 else 0
+    avg_total_degree = sum(total_degrees.values()) / num_nodes if num_nodes > 0 else 0
+    
+    # Compute separate stats for hubs and non-hubs
+    hub_in_degrees = [in_degrees[n] for n in hub_nodes]
+    hub_out_degrees = [out_degrees[n] for n in hub_nodes]
+    nonhub_in_degrees = [in_degrees[n] for n in range(num_nodes) if n not in hub_nodes_set]
+    nonhub_out_degrees = [out_degrees[n] for n in range(num_nodes) if n not in hub_nodes_set]
+    
+    avg_hub_in_degree = sum(hub_in_degrees) / len(hub_in_degrees) if hub_in_degrees else 0
+    avg_hub_out_degree = sum(hub_out_degrees) / len(hub_out_degrees) if hub_out_degrees else 0
+    avg_nonhub_in_degree = sum(nonhub_in_degrees) / len(nonhub_in_degrees) if nonhub_in_degrees else 0
+    avg_nonhub_out_degree = sum(nonhub_out_degrees) / len(nonhub_out_degrees) if nonhub_out_degrees else 0
+    
+    degree_stats = {
+        'avg_hub_in_degree': avg_hub_in_degree,
+        'avg_hub_out_degree': avg_hub_out_degree,
+        'avg_nonhub_in_degree': avg_nonhub_in_degree,
+        'avg_nonhub_out_degree': avg_nonhub_out_degree,
+    }
+    
+    logging.info(f"Selected {len(hub_nodes)} hub nodes by total degree (top {100-percentile}% of {num_nodes} nodes)")
+    logging.info(f"  Degree threshold: {threshold:.1f}")
+    logging.info(f"  In-degree  - Min: {min(in_degrees.values())}, Max: {max(in_degrees.values())}, Avg: {avg_in_degree:.1f}")
+    logging.info(f"  Out-degree - Min: {min(out_degrees.values())}, Max: {max(out_degrees.values())}, Avg: {avg_out_degree:.1f}")
+    logging.info(f"  Total deg  - Min: {min(degree_values)}, Max: {max(degree_values)}, Avg: {avg_total_degree:.1f}")
+    logging.info(f"  Hub avg in-degree: {avg_hub_in_degree:.1f}, Hub avg out-degree: {avg_hub_out_degree:.1f}")
+    logging.info(f"  Non-hub avg in-degree: {avg_nonhub_in_degree:.1f}, Non-hub avg out-degree: {avg_nonhub_out_degree:.1f}")
+    
+    return hub_nodes, degree_stats
+
+
 def build_index_with_hnsw(
     train_data: np.ndarray,
     distance_type: str,
@@ -289,7 +374,7 @@ def build_index_with_hnsw(
         ef_construction=ef_construction,
         M=max_edges_per_node // 2,
     )
-    hnsw_index.set_num_threads(32)
+    hnsw_index.set_num_threads(16)
     
     logging.info("Building HNSW index...")
     start = time.time()
@@ -352,7 +437,20 @@ def run_profiling_pass(
     index.set_num_threads(1)  # Single-threaded for accurate profiling
     
     logging.info(f"Running {mode_name} pass with {result.num_queries} queries...")
-    
+
+    # --- Compute average in/out degree for accessed nodes ---
+    # Get outdegree table
+    outdegree_table = index.get_graph_outdegree_table()
+    num_nodes = len(outdegree_table)
+    out_degrees = {node_id: len(neighbors) for node_id, neighbors in enumerate(outdegree_table)}
+    in_degrees = {node_id: 0 for node_id in range(num_nodes)}
+    for node_id, neighbors in enumerate(outdegree_table):
+        for neighbor_id in neighbors:
+            in_degrees[neighbor_id] += 1
+
+    # Snapshot node access counts BEFORE running queries for this pass
+    node_access_counts_before = dict(index.get_node_access_counts())
+    # Run queries to collect visitation
     perf_available, perf_msg = check_perf_available()
     if use_perf and not perf_available:
         logging.warning(f"perf requested but not available: {perf_msg}")
@@ -361,6 +459,78 @@ def run_profiling_pass(
     elif use_perf:
         logging.info(f"Using perf: {perf_msg}")
     
+    # Helper for recall
+    def _extract_ids(res_obj) -> List[int]:
+        """Robustly extract neighbor IDs from various return formats.
+        Handles FlatNav `(distances, indices)` and HNSW `(indices, distances)`.
+        """
+        import numpy as np
+        # list/tuple container
+        if isinstance(res_obj, (list, tuple)):
+            # tuple of two ndarrays: choose the integer one
+            if (
+                len(res_obj) == 2
+                and isinstance(res_obj[0], np.ndarray)
+                and isinstance(res_obj[1], np.ndarray)
+            ):
+                a0, a1 = res_obj
+                if np.issubdtype(a1.dtype, np.integer):
+                    return [int(x) for x in a1.ravel()]
+                if np.issubdtype(a0.dtype, np.integer):
+                    return [int(x) for x in a0.ravel()]
+                # Fallback: prefer second array
+                try:
+                    return [int(x) for x in a1.astype(np.int64).ravel()]
+                except Exception:
+                    return []
+            # list/tuple of (id, dist)
+            if len(res_obj) > 0 and isinstance(res_obj[0], (list, tuple)) and len(res_obj[0]) >= 1:
+                return [int(x[0]) for x in res_obj]
+            # list/tuple of ids or mixed
+            out: List[int] = []
+            for x in res_obj:
+                if isinstance(x, (int, np.integer)):
+                    out.append(int(x))
+                elif isinstance(x, np.ndarray):
+                    if x.size == 1:
+                        out.append(int(x.item()))
+                    else:
+                        out.extend([int(v) for v in x.ravel()])
+                else:
+                    try:
+                        out.append(int(x))
+                    except Exception:
+                        pass
+            return out
+        # numpy array
+        if isinstance(res_obj, np.ndarray):
+            if res_obj.ndim == 1 and np.issubdtype(res_obj.dtype, np.integer):
+                return [int(x) for x in res_obj]
+            if res_obj.ndim == 2 and res_obj.shape[1] >= 1:
+                # Prefer integer columns if present; else first column
+                for col in range(res_obj.shape[1]):
+                    col_arr = res_obj[:, col]
+                    if np.issubdtype(col_arr.dtype, np.integer):
+                        return [int(x) for x in col_arr]
+                col0 = res_obj[:, 0]
+                try:
+                    return [int(x) for x in col0]
+                except Exception:
+                    return [int(x[0]) for x in res_obj]
+            if res_obj.dtype == object and res_obj.size > 0:
+                first = res_obj.flat[0]
+                if isinstance(first, (list, tuple)) and len(first) >= 1:
+                    return [int(x[0]) for x in res_obj.flat]
+            return []
+        # scalar fallback
+        try:
+            return [int(res_obj)]
+        except Exception:
+            return []
+
+    total_hits = 0.0
+    evaluated = 0
+
     if use_perf:
         # Create a temporary script that will be wrapped by perf
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
@@ -420,7 +590,7 @@ sys.stderr.flush()
 failed_count = 0
 for i, query in enumerate(queries):
     try:
-        _ = index.search_single(query, {k}, {ef_search})
+        _ = index.search_single(query=query, K={k}, ef_search={ef_search})
     except RuntimeError as e:
         failed_count += 1
         if failed_count <= 5:
@@ -502,13 +672,41 @@ print(f"NONHUB_DIST_COMPS:{{nonhub_dist}}")
         
         if failed_queries > 0:
             logging.warning(f"  {failed_queries} queries failed to return {k} results (expected in filtered modes)")
+        
+        # Re-run queries in parent process to collect node access stats (perf subprocess doesn't update parent index)
+        logging.info(f"  Re-running queries in parent process to collect node access statistics...")
+        # Important: reset stats to clear any accumulated counts from previous runs
+        index.reset_stats()
+        index.set_num_threads(1)
+        for qi, query in enumerate(queries):
+            try:
+                res = index.search_single(query=query, K=k, ef_search=ef_search)
+                result_ids = _extract_ids(res)
+                if ground_truth is not None:
+                    gt_row = ground_truth[qi]
+                    gt_set = set(int(x) for x in np.asarray(gt_row)[:k])
+                    hits = sum(1 for rid in result_ids[:k] if rid in gt_set)
+                    total_hits += (hits / float(k)) if k > 0 else 0.0
+                    evaluated += 1
+            except RuntimeError:
+                continue
+        logging.info(f"  Finished re-running {len(queries)} queries for node access stats")
+        if evaluated > 0:
+            result.recall_at_k = total_hits / evaluated
     else:
         # Run without perf
         start_time = time.perf_counter()
         failed_queries = 0
-        for query in queries:
+        for qi, query in enumerate(queries):
             try:
-                _ = index.search_single(query, k, ef_search)
+                res = index.search_single(query=query, K=k, ef_search=ef_search)
+                result_ids = _extract_ids(res)
+                if ground_truth is not None:
+                    gt_row = ground_truth[qi]
+                    gt_set = set(int(x) for x in np.asarray(gt_row)[:k])
+                    hits = sum(1 for rid in result_ids[:k] if rid in gt_set)
+                    total_hits += (hits / float(k)) if k > 0 else 0.0
+                    evaluated += 1
             except RuntimeError as e:
                 # In HUB_ONLY or NONHUB_ONLY modes, we may not find k neighbors
                 # This is expected - just continue
@@ -526,11 +724,42 @@ print(f"NONHUB_DIST_COMPS:{{nonhub_dist}}")
         result.hub_distance_computations = index.get_hub_distance_computations()
         result.nonhub_distance_computations = index.get_nonhub_distance_computations()
         result.total_distance_computations = result.hub_distance_computations + result.nonhub_distance_computations
+        if evaluated > 0:
+            result.recall_at_k = total_hits / evaluated
     
     logging.info(f"  Total distance computations: {result.total_distance_computations:,}")
     logging.info(f"  Hub distance computations: {result.hub_distance_computations:,}")
     logging.info(f"  Non-hub distance computations: {result.nonhub_distance_computations:,}")
     logging.info(f"  Total search time: {result.total_search_time_ms:.2f} ms")
+    logging.info(f"  Recall@{k}: {result.recall_at_k*100:.2f}%")
+
+    # After queries, compute delta-accessed nodes for THIS pass
+    node_access_counts_after = dict(index.get_node_access_counts())
+    # Build union of keys to compute deltas robustly
+    all_keys = set(node_access_counts_before.keys()) | set(node_access_counts_after.keys())
+    accessed_nodes = set()
+    total_delta_accesses = 0
+    for nid in all_keys:
+        before = node_access_counts_before.get(nid, 0)
+        after = node_access_counts_after.get(nid, 0)
+        delta = after - before
+        if delta > 0:
+            accessed_nodes.add(nid)
+            total_delta_accesses += delta
+
+    logging.info(f"  Delta node accesses (this pass): {total_delta_accesses}, Unique nodes accessed (delta): {len(accessed_nodes)}")
+    
+    if accessed_nodes:
+        accessed_in_degrees = [in_degrees[n] for n in accessed_nodes]
+        accessed_out_degrees = [out_degrees[n] for n in accessed_nodes]
+        result.accessed_avg_in_degree = float(np.mean(accessed_in_degrees))
+        result.accessed_avg_out_degree = float(np.mean(accessed_out_degrees))
+        logging.info(f"  Avg in-degree: {result.accessed_avg_in_degree:.2f}, Avg out-degree: {result.accessed_avg_out_degree:.2f}")
+        logging.info(f"  Sample accessed nodes (first 5): {sorted(accessed_nodes)[:5]}")
+    else:
+        result.accessed_avg_in_degree = 0.0
+        result.accessed_avg_out_degree = 0.0
+        logging.warning("  No accessed nodes detected for this pass - degree stats will be 0")
     
     return result
 
@@ -546,12 +775,24 @@ def run_full_profiling(
     ef_search: int,
     k: int,
     hub_percentile: float = 90,
-) -> ProfilingResult:
+    hub_selection_method: str = "access-count",
+    all_queries: Optional[np.ndarray] = None,
+    all_ground_truth: Optional[np.ndarray] = None,
+    num_queries_limit: Optional[int] = None,
+    query_ratio_extremes: bool = False,
+) -> Tuple[ProfilingResult, Optional[Dict[str, ProfilingResult]], Optional[Dict[str, float]]]:
     """
-    Run profiling with normal search pass.
+    Run profiling with normal search pass (and optional ratio-extremes subsets).
+    
+    Args:
+        hub_selection_method: 'access-count' (query-dependent) or 'degree' (static)
+        all_queries: full query set (untrimmed) used to compute ratio extremes
+        all_ground_truth: full ground truth aligned with all_queries
+        num_queries_limit: how many queries to keep for top/bottom subsets
+        query_ratio_extremes: if True, also profile top/bottom queries by hub/nonhub ratio
     
     Returns:
-        ProfilingResult with all metrics
+        (base ProfilingResult, extra_results dict or None, degree_stats dict or None)
     """
     # Build index
     logging.info(f"Building index for {dataset_name}...")
@@ -559,30 +800,88 @@ def run_full_profiling(
         train_data, distance_type, max_edges_per_node, ef_construction
     )
     
-    # First pass: Normal search to get node access distribution
-    logging.info("Pass 0: Getting node access distribution...")
-    index.set_search_mode(SEARCH_MODE_NORMAL)
-    index.reset_stats()
-    index.set_num_threads(1)
+    degree_stats = None
+    # Select hub nodes based on chosen method
+    if hub_selection_method == "degree":
+        logging.info("Using DEGREE-BASED hub classification (static, query-independent)")
+        hub_nodes, degree_stats = select_hub_nodes_by_degree(index, hub_percentile)
+    else:
+        # Default: access-count based (query-dependent)
+        logging.info("Using ACCESS-COUNT-BASED hub classification (query-dependent)")
+        
+        # First pass: Normal search to get node access distribution
+        logging.info("Pass 0: Getting node access distribution...")
+        index.set_search_mode(SEARCH_MODE_NORMAL)
+        index.reset_stats()
+        index.set_num_threads(1)
+        
+        for query in queries:
+            try:
+                _ = index.search_single(query=query, K=k, ef_search=ef_search, num_initializations=100)
+            except RuntimeError:
+                # Should not happen in NORMAL mode, but handle gracefully
+                continue
+        
+        node_access_counts = dict(index.get_node_access_counts())
+        hub_nodes = select_hub_nodes(node_access_counts, hub_percentile)
     
-    for query in queries:
-        try:
-            _ = index.search_single(query, k, ef_search, num_initializations=100)
-        except RuntimeError:
-            # Should not happen in NORMAL mode, but handle gracefully
-            continue
-    
-    node_access_counts = dict(index.get_node_access_counts())
-    
-    # Select hub nodes
-    hub_nodes = select_hub_nodes(node_access_counts, hub_percentile)
+    # Set hub nodes on the index
     index.set_hub_nodes(hub_nodes)
     
-    # Run normal search pass with profiling
+    # Run normal search pass with profiling on the provided query slice
     result = run_profiling_pass(
         index, queries, ground_truth, k, ef_search,
         SEARCH_MODE_NORMAL, "normal", hub_nodes, distance_type, use_perf=True
     )
+    
+    extra_results: Optional[Dict[str, ProfilingResult]] = None
+    
+    if query_ratio_extremes and all_queries is not None and all_ground_truth is not None and num_queries_limit:
+        logging.info("Computing hub/nonhub ratio per query over full query set to select extremes...")
+        # Reset stats and collect per-query hub/nonhub counts
+        ratios: List[Tuple[float, int]] = []
+        index.reset_stats()
+        index.set_collect_stats(True)
+        index.set_search_mode(SEARCH_MODE_NORMAL)
+        index.set_num_threads(1)
+        per_query_stats: List[Tuple[int, int]] = []
+        for q in all_queries:
+            try:
+                _ = index.search_single(query=q, K=k, ef_search=ef_search, num_initializations=100)
+            except RuntimeError:
+                per_query_stats.append((0, 0))
+                continue
+            per_query_stats.append((index.get_hub_distance_computations(), index.get_nonhub_distance_computations()))
+            index.reset_stats()
+        
+        # Compute ratios (hub / nonhub, handle zero)
+        for idx, (hub_c, nonhub_c) in enumerate(per_query_stats):
+            ratio = hub_c / nonhub_c if nonhub_c > 0 else float('inf') if hub_c > 0 else 0.0
+            ratios.append((ratio, idx))
+        
+        ratios_sorted = sorted(ratios, key=lambda x: x[0])
+        bottom_indices = [idx for _, idx in ratios_sorted[:num_queries_limit]]
+        top_indices = [idx for _, idx in ratios_sorted[-num_queries_limit:]]
+        
+        def subset(arr: np.ndarray, indices: List[int]) -> np.ndarray:
+            return np.asarray(arr)[indices]
+        
+        top_queries = subset(all_queries, top_indices)
+        top_gt = subset(all_ground_truth, top_indices)
+        bottom_queries = subset(all_queries, bottom_indices)
+        bottom_gt = subset(all_ground_truth, bottom_indices)
+        
+        extra_results = {}
+        logging.info(f"Profiling TOP ratio queries (count={len(top_queries)})")
+        extra_results["top_ratio"] = run_profiling_pass(
+            index, top_queries, top_gt, k, ef_search,
+            SEARCH_MODE_NORMAL, "top_ratio", hub_nodes, distance_type, use_perf=True
+        )
+        logging.info(f"Profiling BOTTOM ratio queries (count={len(bottom_queries)})")
+        extra_results["bottom_ratio"] = run_profiling_pass(
+            index, bottom_queries, bottom_gt, k, ef_search,
+            SEARCH_MODE_NORMAL, "bottom_ratio", hub_nodes, distance_type, use_perf=True
+        )
     
     # Cleanup
     try:
@@ -590,7 +889,7 @@ def run_full_profiling(
     except OSError:
         pass
     
-    return result
+    return result, extra_results, degree_stats
 
 
 def print_profiling_summary(result: ProfilingResult, dataset_name: str):
@@ -659,41 +958,65 @@ def print_profiling_summary(result: ProfilingResult, dataset_name: str):
     print("=" * 80 + "\n")
 
 
-def save_results(result: ProfilingResult, dataset_name: str, output_path: str):
-    """Save profiling results to JSON file."""
+def save_results(result: ProfilingResult, dataset_name: str, output_path: str, 
+                 extra_results: Optional[Dict[str, ProfilingResult]] = None,
+                 degree_stats: Optional[Dict[str, float]] = None,
+                 hub_selection_method: str = "access-count"):
+    """Save profiling results to JSON file (optionally with extra subsets and degree stats)."""
     os.makedirs(output_path, exist_ok=True)
     
-    pm = result.perf_metrics
-    total_comps = result.hub_distance_computations + result.nonhub_distance_computations
-    hub_pct = result.hub_distance_computations / total_comps * 100 if total_comps > 0 else 0
-    nonhub_pct = result.nonhub_distance_computations / total_comps * 100 if total_comps > 0 else 0
+    def to_dict(res: ProfilingResult) -> Dict[str, Any]:
+        pm = res.perf_metrics
+        total_comps = res.hub_distance_computations + res.nonhub_distance_computations
+        hub_pct = res.hub_distance_computations / total_comps * 100 if total_comps > 0 else 0
+        nonhub_pct = res.nonhub_distance_computations / total_comps * 100 if total_comps > 0 else 0
+        return {
+            'distance_computations': {
+                'total': res.total_distance_computations,
+                'hub': res.hub_distance_computations,
+                'nonhub': res.nonhub_distance_computations,
+                'hub_percentage': hub_pct,
+                'nonhub_percentage': nonhub_pct
+            },
+            'timing': {
+                'total_search_time_ms': res.total_search_time_ms,
+                'num_queries': res.num_queries,
+                'avg_time_per_query_ms': res.total_search_time_ms / res.num_queries if res.num_queries > 0 else 0,
+                'avg_comps_per_query': res.total_distance_computations / res.num_queries if res.num_queries > 0 else 0
+            },
+            'accuracy': {
+                'recall_at_k_percent': res.recall_at_k * 100.0
+            },
+            'perf_metrics': {
+                'cycles': pm.cycles,
+                'instructions': pm.instructions,
+                'IPC': pm.ipc,
+                'cache_miss_rate': pm.cache_miss_rate,
+                'l1_miss_rate': pm.l1_miss_rate,
+                'cycles_per_computation': pm.cycles / res.total_distance_computations if res.total_distance_computations > 0 else 0,
+                'cache_misses_per_computation': pm.cache_misses / res.total_distance_computations if res.total_distance_computations > 0 else 0
+            },
+            'accessed_node_degrees': {
+                'avg_in_degree': res.accessed_avg_in_degree,
+                'avg_out_degree': res.accessed_avg_out_degree
+            }
+        }
     
-    output_data = {
+    output_data: Dict[str, Any] = {
         'dataset': dataset_name,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'distance_computations': {
-            'total': result.total_distance_computations,
-            'hub': result.hub_distance_computations,
-            'nonhub': result.nonhub_distance_computations,
-            'hub_percentage': hub_pct,
-            'nonhub_percentage': nonhub_pct
-        },
-        'timing': {
-            'total_search_time_ms': result.total_search_time_ms,
-            'num_queries': result.num_queries,
-            'avg_time_per_query_ms': result.total_search_time_ms / result.num_queries if result.num_queries > 0 else 0,
-            'avg_comps_per_query': result.total_distance_computations / result.num_queries if result.num_queries > 0 else 0
-        },
-        'perf_metrics': {
-            'cycles': pm.cycles,
-            'instructions': pm.instructions,
-            'IPC': pm.ipc,
-            'cache_miss_rate': pm.cache_miss_rate,
-            'l1_miss_rate': pm.l1_miss_rate,
-            'cycles_per_computation': pm.cycles / result.total_distance_computations if result.total_distance_computations > 0 else 0,
-            'cache_misses_per_computation': pm.cache_misses / result.total_distance_computations if result.total_distance_computations > 0 else 0
-        }
+        'hub_selection_method': hub_selection_method,
+        'baseline': to_dict(result)
     }
+    
+    # Add degree statistics if available (only for degree-based hub selection)
+    if degree_stats is not None:
+        output_data['degree_statistics'] = degree_stats
+    
+    if extra_results:
+        output_data['query_ratio_extremes'] = {
+            key: to_dict(val) for key, val in extra_results.items()
+        }
     
     filepath = os.path.join(output_path, f"{dataset_name}_hub_profile.json")
     with open(filepath, 'w') as f:
@@ -757,6 +1080,20 @@ def parse_args() -> argparse.Namespace:
     )
     
     parser.add_argument(
+        "--hub-selection-method",
+        type=str,
+        choices=["access-count", "degree"],
+        default="access-count",
+        help="Method for hub classification: 'access-count' (query-dependent) or 'degree' (static, query-independent)"
+    )
+
+    parser.add_argument(
+        "--query-ratio-extremes",
+        action="store_true",
+        help="If set, identify top/bottom num-queries by hub/nonhub access ratio and profile them separately"
+    )
+    
+    parser.add_argument(
         "--output-path",
         type=str,
         default=PROFILE_OUTPUT_PATH,
@@ -789,17 +1126,20 @@ def main():
         logging.info(f"Loading dataset {dataset_name} from {base_path}")
         train_data, queries, ground_truth = load_dataset(base_path, dataset_name)
         
-        # Limit queries if specified
-        if args.num_queries and args.num_queries < len(queries):
-            queries = queries[:args.num_queries]
-            ground_truth = ground_truth[:args.num_queries]
-            logging.info(f"Limited to {len(queries)} queries")
+        # Shuffle queries and ground_truth together
+        combined = list(zip(queries, ground_truth))
+        random.shuffle(combined)
+        all_queries, all_ground_truth = zip(*combined)
+        
+        # Select num_queries after shuffling for baseline runs
+        queries = all_queries[:args.num_queries]
+        ground_truth = all_ground_truth[:args.num_queries]
         
         logging.info(f"Dataset: {train_data.shape[0]} vectors, {train_data.shape[1]} dimensions")
-        logging.info(f"Queries: {len(queries)}")
+        logging.info(f"Queries (baseline slice): {len(queries)}; full queries available: {len(all_queries)}")
         
-        # Run profiling
-        result = run_full_profiling(
+        # Run profiling (with optional ratio extremes)
+        result, extra_results, degree_stats = run_full_profiling(
             dataset_name=dataset_name,
             train_data=train_data,
             queries=queries,
@@ -810,11 +1150,17 @@ def main():
             ef_search=args.ef_search,
             k=args.k,
             hub_percentile=args.hub_percentile,
+            hub_selection_method=args.hub_selection_method,
+            all_queries=np.array(all_queries),
+            all_ground_truth=np.array(all_ground_truth),
+            num_queries_limit=args.num_queries,
+            query_ratio_extremes=args.query_ratio_extremes,
         )
         
         # Print and save results
         print_profiling_summary(result, dataset_name)
-        save_results(result, dataset_name, args.output_path)
+        save_results(result, dataset_name, args.output_path, extra_results, 
+                     degree_stats, args.hub_selection_method)
 
 
 if __name__ == "__main__":
