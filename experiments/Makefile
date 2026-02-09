@@ -642,7 +642,7 @@ profile-hub-compute:
 		--num-node-links 32 \
 		--hub-percentile 90 \
 		--hub-selection-method degree \
-		--num-queries 1000
+		--num-queries 10000
 
 profile-hub-compute-extremes:
 	poetry run python profile_hub_compute.py \
@@ -653,6 +653,46 @@ profile-hub-compute-extremes:
 		--num-node-links 32 \
 		--hub-percentile 90 \
 		--hub-selection-method degree \
+		--num-queries 1000 \
+		--query-ratio-extremes
+
+# Profile hub vs non-hub compute with batch search
+profile-hub-compute-batch:
+	poetry run python profile_hub_compute_batch.py \
+		--dataset gist-960-euclidean \
+		--k 100 \
+		--ef-construction 40 \
+		--ef-search 1000 \
+		--num-node-links 32 \
+		--hub-percentile 90 \
+		--hub-selection-method degree \
+		--num-search-threads 2 \
+		--num-queries 10000 \
+		--enable-perf
+
+profile-hub-compute-batch-trace:
+	poetry run python profile_hub_compute_batch.py \
+		--dataset gist-960-euclidean \
+		--k 10 \
+		--ef-construction 40 \
+		--ef-search 1000 \
+		--num-node-links 8 \
+		--hub-percentile 99 \
+		--hub-selection-method degree \
+		--num-search-threads 2 \
+		--num-queries 10000 \
+		--dump-search-trace
+
+profile-hub-compute-batch-extremes:
+	poetry run python profile_hub_compute_batch.py \
+		--dataset gist-960-euclidean \
+		--k 100 \
+		--ef-construction 40 \
+		--ef-search 1000 \
+		--num-node-links 32 \
+		--hub-percentile 90 \
+		--hub-selection-method degree \
+		--num-search-threads 1 \
 		--num-queries 1000 \
 		--query-ratio-extremes
 

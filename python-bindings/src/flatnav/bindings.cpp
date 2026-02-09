@@ -365,6 +365,14 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     _index->clearVisitedNodesWithIDs();
   }
 
+  std::vector<std::vector<std::vector<std::pair<uint32_t, bool>>>> getVisitedNodesByLevel() {
+    return _index->getVisitedNodesByLevel();
+  }
+
+  void clearVisitedNodesByLevel() {
+    _index->clearVisitedNodesByLevel();
+  }
+
   std::vector<std::vector<uint32_t>> getGraphOutdegreeTable() {
     return _index->getGraphOutdegreeTable();
   }
@@ -589,6 +597,10 @@ void bindSpecialization(py::module_& index_submodule) {
            "Returns list of (node_id, is_hub) pairs for each query's visited sequence")
       .def("clear_visited_nodes_with_ids", &IndexType::clearVisitedNodesWithIDs,
            "Clear the accumulated visited nodes with IDs data")
+      .def("get_visited_nodes_by_level", &IndexType::getVisitedNodesByLevel,
+           "Returns list of [query][level][node_pairs] where each level is one beam search iteration")
+      .def("clear_visited_nodes_by_level", &IndexType::clearVisitedNodesByLevel,
+           "Clear the accumulated visited nodes by level data")
       .def(
           "search_single_with_node_ids",
           [](IndexType& index, const py::array& query, int K, int ef_search, int num_initializations = 100) {

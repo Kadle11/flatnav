@@ -111,13 +111,15 @@ fi
 # NOTE: Mounting the ~/.aws directory so that the container can access the aws credentials
 # to upload the indexes to s3. This is not the most secure thing to do, but it's the easiest.
 docker run \
-        --name $CONTAINER_NAME \
-        --privileged \
-        -it \
-        --volume ${DATA_DIR}:/root/data \
-        --volume ${METRICS_DIR}:/root/metrics \
-        --volume $(pwd)/node-access-distributions:/root/node-access-distributions \
-        --volume $(pwd)/edge-lengths:/root/edge-lengths \
-        --volume $(pwd)/neighborhood-tests:/root/data/neighborhood-tests \
-        --rm flatnav:$TAG_NAME \
-        make $1
+    --memory=96g \
+    --memory-swap=96g \
+    --name $CONTAINER_NAME \
+    --privileged \
+    -it \
+    --volume ${DATA_DIR}:/root/data \
+    --volume ${METRICS_DIR}:/root/metrics \
+    --volume $(pwd)/node-access-distributions:/root/node-access-distributions \
+    --volume $(pwd)/edge-lengths:/root/edge-lengths \
+    --volume $(pwd)/neighborhood-tests:/root/data/neighborhood-tests \
+    --rm flatnav:$TAG_NAME \
+    make $1

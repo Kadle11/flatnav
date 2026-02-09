@@ -102,6 +102,11 @@ class Index {
   // Used for neighborhood profiling analysis.
   std::vector<std::vector<std::pair<uint32_t, bool>>> _visited_nodes_with_ids;
 
+  // Keep track of visited nodes organized by expansion level (BFS-like).
+  // Structure: [query_idx][level_idx][node_pairs]
+  // Each level represents one iteration of the beam search while loop.
+  std::vector<std::vector<std::vector<std::pair<uint32_t, bool>>>> _visited_nodes_by_level;
+
   bool* _hub_nodes; // A boolean array to keep track of hub nodes.
   // If a node is a hub, then _hub_nodes[node] = true, else false.
 
@@ -307,6 +312,21 @@ class Index {
    */
   void clearVisitedNodesWithIDs() {
     _visited_nodes_with_ids.clear();
+  }
+
+  /**
+   * @brief Get the sequence of visited nodes organized by expansion level (BFS-like).
+   * @return Vector of [query][level][node_pairs], where each level is one iteration of beam search.
+   */
+  std::vector<std::vector<std::vector<std::pair<uint32_t, bool>>>> getVisitedNodesByLevel() {
+    return _visited_nodes_by_level;
+  }
+
+  /**
+   * @brief Clear the accumulated visited nodes by level data.
+   */
+  void clearVisitedNodesByLevel() {
+    _visited_nodes_by_level.clear();
   }
 
 
@@ -992,6 +1012,8 @@ class Index {
     // Keep track of the nodes visited during the search with their IDs
     std::vector<bool> query_visited_nodes_flags;
     std::vector<std::pair<uint32_t, bool>> query_visited_nodes_with_ids;
+    // Track nodes by level: each level is one iteration of the while loop
+    std::vector<std::vector<std::pair<uint32_t, bool>>> query_visited_nodes_by_level;
 
     auto *visited_set = _visited_set_pool->pollAvailableSet();
     visited_set->clear();
@@ -1016,35 +1038,56 @@ class Index {
     neighbors.emplace(dist, entry_node);
     query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);
     query_visited_nodes_with_ids.push_back({entry_node, _hub_nodes[entry_node]});
+    
     visited_set->insert(entry_node);
 
     if (is_search_stage) {
       _node_access_counts[entry_node]++;
     }
 
+    // For true BFS-like level tracking, we need to process all candidates
+    // at the same "depth" before moving to the next level.
+    // We use a snapshot of candidates at the start of each level.
     while (!candidates.empty()) {
-      auto [distance, node] = candidates.top();
+      // Take a snapshot of current candidates size to process this "level"
+      size_t candidates_in_this_level = candidates.size();
+      
+      // Prepare the next level's node vector
+      std::vector<std::pair<uint32_t, bool>> next_level_nodes;
+      
+      // Process all candidates that were in the queue at the start of this level
+      for (size_t i = 0; i < candidates_in_this_level && !candidates.empty(); ++i) {
+        auto [distance, node] = candidates.top();
 
-      if (-distance > max_dist && neighbors.size() >= buffer_size) {
-        break;
-      }
-      candidates.pop();
+        if (-distance > max_dist && neighbors.size() >= buffer_size) {
+          // Early termination - but we've already started this level, so we break
+          candidates = PriorityQueue(); // Clear remaining candidates
+          break;
+        }
+        candidates.pop();
 
 #ifdef USE_SSE
-      if (!candidates.empty()) {
-        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
-        visited_set->prefetch(candidates.top().second);
-      }
+        if (!candidates.empty()) {
+          _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
+          visited_set->prefetch(candidates.top().second);
+        }
 #endif
 
-      processCandidateNodeWithIDs<is_search_stage>(
-          query, node, max_dist, buffer_size, visited_set,
-          neighbors, candidates, query_visited_nodes_flags,
-          query_visited_nodes_with_ids);
+        processCandidateNodeWithIDs<is_search_stage>(
+            query, node, max_dist, buffer_size, visited_set,
+            neighbors, candidates, query_visited_nodes_flags,
+            query_visited_nodes_with_ids, next_level_nodes);
+      }
+      
+      // Only add this level if nodes were actually processed
+      if (!next_level_nodes.empty()) {
+        query_visited_nodes_by_level.push_back(std::move(next_level_nodes));
+      }
     }
 
     _visited_nodes_sequence.push_back(std::move(query_visited_nodes_flags));
     _visited_nodes_with_ids.push_back(std::move(query_visited_nodes_with_ids));
+    _visited_nodes_by_level.push_back(std::move(query_visited_nodes_by_level));
 
     _visited_set_pool->pushVisitedSet(visited_set);
 
@@ -1059,12 +1102,14 @@ class Index {
                                    const int buffer_size, VisitedSet *visited_set,
                                    PriorityQueue &neighbors, PriorityQueue &candidates,
                                    std::vector<bool>& query_visited_nodes_flags,
-                                   std::vector<std::pair<uint32_t, bool>>& query_visited_nodes_with_ids) {
+                                   std::vector<std::pair<uint32_t, bool>>& query_visited_nodes_with_ids,
+                                   std::vector<std::pair<uint32_t, bool>>& level_nodes) {
     std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
 
     node_id_t *neighbor_node_links = getNodeLinks(node);
     query_visited_nodes_flags.push_back(_hub_nodes[node]);
     query_visited_nodes_with_ids.push_back({node, _hub_nodes[node]});
+    level_nodes.push_back({node, _hub_nodes[node]});
 
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];

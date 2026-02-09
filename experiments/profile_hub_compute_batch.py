@@ -58,7 +58,7 @@ SYNTHETIC_DATASETS = [
     # "normal-128-angular",
     # "normal-128-euclidean",
     # "normal-256-angular",
-    "normal-256-euclidean",
+    # "normal-256-euclidean",
     # "normal-512-euclidean",
     # "normal-1024-angular",
     # "normal-1024-euclidean",
@@ -69,9 +69,11 @@ SYNTHETIC_DATASETS = [
 ANN_DATASETS = [
     # "glove-100-angular",
     # "nytimes-256-angular",
-    # "gist-960-euclidean",
+    "gist-960-euclidean",
+    "mnist-784-euclidean",
     # "yandex-deep-10m-euclidean",
     # "spacev-10m-euclidean",
+    "sift-128-euclidean"
 ]
 
 
@@ -589,14 +591,11 @@ print(f"DEBUG: Starting search with mode={search_mode}", file=sys.stderr)
 sys.stderr.flush()
 
 failed_count = 0
-for i, query in enumerate(queries):
-    try:
-        _ = index.search_single(query=query, K={k}, ef_search={ef_search})
-    except RuntimeError as e:
-        failed_count += 1
-        if failed_count <= 5:
-            print(f"DEBUG: Query {{i}} failed: {{e}}", file=sys.stderr)
-        continue
+try:
+    _ = index.search(queries=queries, K={k}, ef_search={ef_search})
+except RuntimeError as e:
+    print(f"DEBUG: Search failed: {{e}}", file=sys.stderr)
+    failed_count = len(queries)
 
 print(f"DEBUG: Finished search loop, failed_count={{failed_count}}", file=sys.stderr)
 sys.stderr.flush()
@@ -680,18 +679,23 @@ sys.stdout.flush()
         # Important: reset stats to clear any accumulated counts from previous runs
         index.reset_stats()
         index.set_num_threads(num_search_threads)
-        for qi, query in enumerate(queries):
-            try:
-                res = index.search_single(query=query, K=k, ef_search=ef_search)
-                result_ids = _extract_ids(res)
-                if ground_truth is not None:
-                    gt_row = ground_truth[qi]
-                    gt_set = set(int(x) for x in np.asarray(gt_row)[:k])
-                    hits = sum(1 for rid in result_ids[:k] if rid in gt_set)
-                    total_hits += (hits / float(k)) if k > 0 else 0.0
-                    evaluated += 1
-            except RuntimeError:
-                continue
+        try:
+            search_result = index.search(queries=queries, K=k, ef_search=ef_search)
+            # result is typically (distances, indices) where each is a 2D array [num_queries, K]
+            # Extract indices - should be second element
+            if isinstance(search_result, tuple) and len(search_result) == 2:
+                indices_batch = search_result[1]  # Should be shape [num_queries, K]
+                if isinstance(indices_batch, np.ndarray) and indices_batch.ndim == 2:
+                    for qi in range(len(queries)):
+                        result_ids = [int(x) for x in indices_batch[qi]]
+                        if ground_truth is not None:
+                            gt_row = ground_truth[qi]
+                            gt_set = set(int(x) for x in np.asarray(gt_row)[:k])
+                            hits = sum(1 for rid in result_ids[:k] if rid in gt_set)
+                            total_hits += (hits / float(k)) if k > 0 else 0.0
+                            evaluated += 1
+        except RuntimeError:
+            pass
         logging.info(f"  Finished re-running {len(queries)} queries for node access stats")
         if evaluated > 0:
             result.recall_at_k = total_hits / evaluated
@@ -699,21 +703,26 @@ sys.stdout.flush()
         # Run without perf
         start_time = time.perf_counter()
         failed_queries = 0
-        for qi, query in enumerate(queries):
-            try:
-                res = index.search_single(query=query, K=k, ef_search=ef_search)
-                result_ids = _extract_ids(res)
-                if ground_truth is not None:
-                    gt_row = ground_truth[qi]
-                    gt_set = set(int(x) for x in np.asarray(gt_row)[:k])
-                    hits = sum(1 for rid in result_ids[:k] if rid in gt_set)
-                    total_hits += (hits / float(k)) if k > 0 else 0.0
-                    evaluated += 1
-            except RuntimeError as e:
-                # In HUB_ONLY or NONHUB_ONLY modes, we may not find k neighbors
-                # This is expected - just continue
-                failed_queries += 1
-                continue
+        try:
+            search_result = index.search(queries=queries, K=k, ef_search=ef_search)
+            # result is typically (distances, indices) where each is a 2D array [num_queries, K]
+            # Extract indices - should be second element
+            if isinstance(search_result, tuple) and len(search_result) == 2:
+                indices_batch = search_result[1]  # Should be shape [num_queries, K]
+                if isinstance(indices_batch, np.ndarray) and indices_batch.ndim == 2:
+                    for qi in range(len(queries)):
+                        result_ids = [int(x) for x in indices_batch[qi]]
+                        if ground_truth is not None:
+                            gt_row = ground_truth[qi]
+                            gt_set = set(int(x) for x in np.asarray(gt_row)[:k])
+                            hits = sum(1 for rid in result_ids[:k] if rid in gt_set)
+                            total_hits += (hits / float(k)) if k > 0 else 0.0
+                            evaluated += 1
+        except RuntimeError as e:
+            # In HUB_ONLY or NONHUB_ONLY modes, we may not find k neighbors
+            # This is expected - just log it
+            failed_queries = len(queries)
+            logging.warning(f"Search failed: {e}")
         end_time = time.perf_counter()
         
         if failed_queries > 0:
@@ -783,6 +792,9 @@ def run_full_profiling(
     num_queries_limit: Optional[int] = None,
     query_ratio_extremes: bool = False,
     num_search_threads: int = 1,
+    dump_search_trace: bool = False,
+    enable_perf: bool = False,
+    output_path: str = PROFILE_OUTPUT_PATH,
 ) -> Tuple[ProfilingResult, Optional[Dict[str, ProfilingResult]], Optional[Dict[str, float]]]:
     """
     Run profiling with normal search pass (and optional ratio-extremes subsets).
@@ -793,6 +805,9 @@ def run_full_profiling(
         all_ground_truth: full ground truth aligned with all_queries
         num_queries_limit: how many queries to keep for top/bottom subsets
         query_ratio_extremes: if True, also profile top/bottom queries by hub/nonhub ratio
+        dump_search_trace: if True, dump detailed level-by-level search trace to JSON
+        enable_perf: if True, enable hardware counter profiling with perf tool
+        output_path: directory path for output files
     
     Returns:
         (base ProfilingResult, extra_results dict or None, degree_stats dict or None)
@@ -834,7 +849,7 @@ def run_full_profiling(
     # Run normal search pass with profiling on the provided query slice
     result = run_profiling_pass(
         index, queries, ground_truth, k, ef_search,
-        SEARCH_MODE_NORMAL, "normal", hub_nodes, distance_type, use_perf=True,
+        SEARCH_MODE_NORMAL, "normal", hub_nodes, distance_type, use_perf=enable_perf,
         num_search_threads=num_search_threads
     )
     
@@ -888,6 +903,72 @@ def run_full_profiling(
             SEARCH_MODE_NORMAL, "bottom_ratio", hub_nodes, distance_type, use_perf=True,
             num_search_threads=num_search_threads
         )
+    
+    # Dump search trace if requested
+    if dump_search_trace:
+        logging.info("Collecting search trace data with level-by-level node visitation...")
+        # Clear previous data and run searches with node ID tracking
+        index.clear_visited_nodes_by_level()
+        index.set_num_threads(1)  # Use single thread for deterministic trace
+
+        # Run all queries with node tracking
+        total_queries = len(queries)
+        for i, query in enumerate(queries):
+            if (i + 1) % 10 == 0:
+                logging.info(f"  Collecting trace for query {i+1}/{total_queries}")
+            try:
+                _ = index.search_single_with_node_ids(
+                    query=query, K=k, ef_search=ef_search, num_initializations=100
+                )
+            except RuntimeError:
+                continue
+
+        # Get the level-by-level data
+        visited_by_level = index.get_visited_nodes_by_level()
+
+        # Convert to JSON-serializable format
+        trace_data = {
+            'dataset': dataset_name,
+            'num_queries_traced': len(visited_by_level),
+            'ef_search': ef_search,
+            'k': k,
+            'hub_percentile': hub_percentile,
+            'hub_selection_method': hub_selection_method,
+            'queries': []
+        }
+
+        hub_nodes_set = set(hub_nodes)
+        for query_idx, query_levels in enumerate(visited_by_level):
+            query_trace = {
+                'query_id': query_idx,
+                'num_levels': len(query_levels),
+                'levels': []
+            }
+            for level_idx, level_nodes in enumerate(query_levels):
+                level_data = {
+                    'level': level_idx,
+                    'num_nodes': len(level_nodes),
+                    'nodes': [
+                        {'node_id': int(node_id), 'is_hub': (int(node_id) in hub_nodes_set)}
+                        for node_id, _ in level_nodes
+                    ]
+                }
+                query_trace['levels'].append(level_data)
+            trace_data['queries'].append(query_trace)
+
+        # Save to file
+        os.makedirs(output_path, exist_ok=True)
+        trace_filepath = os.path.join(output_path, f"{dataset_name}_search_trace.json")
+        with open(trace_filepath, 'w') as f:
+            json.dump(trace_data, f, indent=2)
+        logging.info(f"Search trace saved to {trace_filepath}")
+
+        # Also dump visited_nodes_flags (sequential visitation flags) as-is
+        visited_nodes_flags = index.get_visited_nodes_sequence()
+        flags_filepath = os.path.join(output_path, f"{dataset_name}_visited_nodes_flags.json")
+        with open(flags_filepath, 'w') as f:
+            json.dump(visited_nodes_flags, f, indent=2)
+        logging.info(f"Visited nodes flags saved to {flags_filepath}")
     
     # Cleanup
     try:
@@ -1024,7 +1105,7 @@ def save_results(result: ProfilingResult, dataset_name: str, output_path: str,
             key: to_dict(val) for key, val in extra_results.items()
         }
     
-    filepath = os.path.join(output_path, f"{dataset_name}_hub_profile.json")
+    filepath = os.path.join(output_path, f"{dataset_name}_batch_hub_profile.json")
     with open(filepath, 'w') as f:
         json.dump(output_data, f, indent=2)
     
@@ -1117,7 +1198,19 @@ def parse_args() -> argparse.Namespace:
         "--num-search-threads",
         type=int,
         default=1,
-        help="Number of threads for search operations (default: 1 for accurate profiling)"
+        help="Number of threads for batch search operations (default: 1 for accurate profiling)"
+    )
+    
+    parser.add_argument(
+        "--dump-search-trace",
+        action="store_true",
+        help="Dump detailed search trace with level-by-level node visitation to JSON file"
+    )
+    
+    parser.add_argument(
+        "--enable-perf",
+        action="store_true",
+        help="Enable hardware counter profiling with perf tool (requires Linux perf availability)"
     )
     
     return parser.parse_args()
@@ -1143,7 +1236,11 @@ def main():
         combined = list(zip(queries, ground_truth))
         random.shuffle(combined)
         all_queries, all_ground_truth = zip(*combined)
-        
+
+        # Convert to contiguous numpy arrays for batch search
+        all_queries = np.stack(all_queries)
+        all_ground_truth = np.stack(all_ground_truth)
+
         # Select num_queries after shuffling for baseline runs
         queries = all_queries[:args.num_queries]
         ground_truth = all_ground_truth[:args.num_queries]
@@ -1164,10 +1261,14 @@ def main():
             k=args.k,
             hub_percentile=args.hub_percentile,
             hub_selection_method=args.hub_selection_method,
-            all_queries=np.array(all_queries),
-            all_ground_truth=np.array(all_ground_truth),
+            all_queries=all_queries,
+            all_ground_truth=all_ground_truth,
             num_queries_limit=args.num_queries,
             query_ratio_extremes=args.query_ratio_extremes,
+            num_search_threads=args.num_search_threads,
+            dump_search_trace=args.dump_search_trace,
+            enable_perf=args.enable_perf,
+            output_path=args.output_path,
         )
         
         # Print and save results
