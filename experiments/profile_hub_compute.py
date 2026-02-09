@@ -69,9 +69,10 @@ SYNTHETIC_DATASETS = [
 ANN_DATASETS = [
     # "glove-100-angular",
     # "nytimes-256-angular",
-    # "gist-960-euclidean",
+    "gist-960-euclidean",
     # "yandex-deep-10m-euclidean",
     # "spacev-10m-euclidean",
+     "sift-128-euclidean",
 ]
 
 
@@ -131,6 +132,25 @@ class ProfilingResult:
     # Degree stats for accessed nodes
     accessed_avg_in_degree: float = 0.0
     accessed_avg_out_degree: float = 0.0
+    # Node counts
+    hub_node_count: int = 0
+    nonhub_node_count: int = 0
+
+    # Averages per node
+    avg_comps_per_hub_node: float = 0.0
+    avg_comps_per_nonhub_node: float = 0.0
+
+    # Estimated timing split (ms)
+    estimated_time_ms_hubs: float = 0.0
+    estimated_time_ms_nonhubs: float = 0.0
+
+    # Estimated cycles split
+    estimated_cycles_hubs: int = 0
+    estimated_cycles_nonhubs: int = 0
+
+    # Average estimated time per node (ms)
+    avg_time_per_hub_node_ms: float = 0.0
+    avg_time_per_nonhub_node_ms: float = 0.0
     
     # Accuracy (fraction [0,1])
     recall_at_k: float = 0.0
@@ -733,6 +753,49 @@ print(f"NONHUB_DIST_COMPS:{{nonhub_dist}}")
     logging.info(f"  Total search time: {result.total_search_time_ms:.2f} ms")
     logging.info(f"  Recall@{k}: {result.recall_at_k*100:.2f}%")
 
+    # Compute hub / non-hub node counts and per-node averages
+    result.hub_node_count = len(hub_nodes)
+    result.nonhub_node_count = max(0, num_nodes - result.hub_node_count)
+
+    # Average computations per hub / non-hub node
+    if result.hub_node_count > 0:
+        result.avg_comps_per_hub_node = result.hub_distance_computations / float(result.hub_node_count)
+    else:
+        result.avg_comps_per_hub_node = 0.0
+
+    if result.nonhub_node_count > 0:
+        result.avg_comps_per_nonhub_node = result.nonhub_distance_computations / float(result.nonhub_node_count)
+    else:
+        result.avg_comps_per_nonhub_node = 0.0
+
+    # Compute estimated timing split based on proportion of distance computations
+    total_comps = result.hub_distance_computations + result.nonhub_distance_computations
+    if total_comps > 0:
+        # Time estimated by computation proportion
+        result.estimated_time_ms_hubs = result.total_search_time_ms * (result.hub_distance_computations / float(total_comps))
+        result.estimated_time_ms_nonhubs = result.total_search_time_ms * (result.nonhub_distance_computations / float(total_comps))
+
+        # Estimated cycles split (if perf data available)
+        if result.perf_metrics.cycles > 0:
+            result.estimated_cycles_hubs = int(round(result.perf_metrics.cycles * (result.hub_distance_computations / float(total_comps))))
+            result.estimated_cycles_nonhubs = int(result.perf_metrics.cycles - result.estimated_cycles_hubs)
+    else:
+        result.estimated_time_ms_hubs = 0.0
+        result.estimated_time_ms_nonhubs = 0.0
+        result.estimated_cycles_hubs = 0
+        result.estimated_cycles_nonhubs = 0
+
+    # Average estimated time per hub/nonhub node
+    if result.hub_node_count > 0:
+        result.avg_time_per_hub_node_ms = result.estimated_time_ms_hubs / float(result.hub_node_count)
+    else:
+        result.avg_time_per_hub_node_ms = 0.0
+
+    if result.nonhub_node_count > 0:
+        result.avg_time_per_nonhub_node_ms = result.estimated_time_ms_nonhubs / float(result.nonhub_node_count)
+    else:
+        result.avg_time_per_nonhub_node_ms = 0.0
+
     # After queries, compute delta-accessed nodes for THIS pass
     node_access_counts_after = dict(index.get_node_access_counts())
     # Build union of keys to compute deltas robustly
@@ -954,6 +1017,26 @@ def print_profiling_summary(result: ProfilingResult, dataset_name: str):
         nonhub_pct = result.nonhub_distance_computations / total_comps * 100
         print(f"Hub computations: {result.hub_distance_computations:,} ({hub_pct:.1f}%)")
         print(f"Non-hub computations: {result.nonhub_distance_computations:,} ({nonhub_pct:.1f}%)")
+
+    # Node counts and per-node averages
+    print("")
+    print(f"Hub node count: {result.hub_node_count}")
+    print(f"Non-hub node count: {result.nonhub_node_count}")
+    if result.hub_node_count > 0:
+        print(f"Avg comps per hub node: {result.avg_comps_per_hub_node:.2f}")
+        print(f"Avg time per hub node (est): {result.avg_time_per_hub_node_ms:.4f} ms")
+    if result.nonhub_node_count > 0:
+        print(f"Avg comps per non-hub node: {result.avg_comps_per_nonhub_node:.2f}")
+        print(f"Avg time per non-hub node (est): {result.avg_time_per_nonhub_node_ms:.6f} ms")
+
+    # Estimated timing split
+    if total_comps > 0:
+        print("")
+        print(f"Estimated time spent on hub computations: {result.estimated_time_ms_hubs:.3f} ms")
+        print(f"Estimated time spent on non-hub computations: {result.estimated_time_ms_nonhubs:.3f} ms")
+        if result.perf_metrics.cycles > 0:
+            print(f"Estimated cycles for hubs: {result.estimated_cycles_hubs:,}")
+            print(f"Estimated cycles for non-hubs: {result.estimated_cycles_nonhubs:,}")
     
     print("=" * 80 + "\n")
 
@@ -977,6 +1060,18 @@ def save_results(result: ProfilingResult, dataset_name: str, output_path: str,
                 'nonhub': res.nonhub_distance_computations,
                 'hub_percentage': hub_pct,
                 'nonhub_percentage': nonhub_pct
+            },
+            'hub_nonhub_breakdown': {
+                'hub_node_count': res.hub_node_count,
+                'nonhub_node_count': res.nonhub_node_count,
+                'avg_comps_per_hub_node': res.avg_comps_per_hub_node,
+                'avg_comps_per_nonhub_node': res.avg_comps_per_nonhub_node,
+                'estimated_time_ms_hubs': res.estimated_time_ms_hubs,
+                'estimated_time_ms_nonhubs': res.estimated_time_ms_nonhubs,
+                'avg_time_per_hub_node_ms': res.avg_time_per_hub_node_ms,
+                'avg_time_per_nonhub_node_ms': res.avg_time_per_nonhub_node_ms,
+                'estimated_cycles_hubs': res.estimated_cycles_hubs,
+                'estimated_cycles_nonhubs': res.estimated_cycles_nonhubs,
             },
             'timing': {
                 'total_search_time_ms': res.total_search_time_ms,

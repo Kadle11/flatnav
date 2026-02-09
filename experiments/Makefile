@@ -637,10 +637,10 @@ profile-hub-compute:
 	poetry run python profile_hub_compute.py \
 		--dataset gist-960-euclidean \
 		--k 100 \
-		--ef-construction 40 \
+		--ef-construction 100 \
 		--ef-search 1000 \
-		--num-node-links 32 \
-		--hub-percentile 90 \
+		--num-node-links 48 \
+		--hub-percentile 99 \
 		--hub-selection-method degree \
 		--num-queries 1000
 
@@ -655,6 +655,21 @@ profile-hub-compute-extremes:
 		--hub-selection-method degree \
 		--num-queries 1000 \
 		--query-ratio-extremes
+
+# Plot hub profile metrics (distance computations, timings, cycles)
+plot-hub-profile:
+	poetry run python plot_hub_profile.py
+
+plot-hub-profile-file:
+	poetry run python plot_hub_profile.py \
+		--profile-path /root/metrics/hub_profiling/normal-64-euclidean_hub_profile.json
+
+# Plot aggregate per-node averages across all datasets
+plot-hub-profile-aggregate:
+	@echo "Running aggregate hub profile plots (poetry)..."
+	poetry run python plot_hub_profile.py --aggregate-only --profile-dir /root/metrics/hub_profiling --output-path /root/metrics/hub_profiling/plots || true
+	@echo "Saving collected aggregates to /root/metrics/hub_profiling/aggregates.json"
+	poetry run python -c "import json; from experiments.plot_hub_profile import collect_per_node_averages; json.dump(collect_per_node_averages('/root/metrics/hub_profiling'), open('/root/metrics/hub_profiling/aggregates.json','w'), indent=2)" || true
 
 # Profile neighborhood access patterns during search
 neighborhood-profile:
