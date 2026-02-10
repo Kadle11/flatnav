@@ -112,7 +112,7 @@ def summarize_trace(trace: dict) -> dict:
 
 
 def bytes_trivial_offload() -> int:
-    return S_VERTEX_BYTES + S_DISTANCE_BYTES
+    return 2*S_VERTEX_BYTES + S_DISTANCE_BYTES
 
 
 def bytes_reuse(dim: int) -> int:
