@@ -709,6 +709,12 @@ plot-neighborhood-results:
 		--hubness-percentile 99 \
 		--num-bins 30
 
+# Plot distance memory metrics from search step traces
+plot-search-trace-distance-memory:
+	poetry run python plot_search_trace_distance_memory.py \
+		--input-dir /root/metrics/search_step_trace \
+		--output-dir /root/metrics/search_step_trace/plots
+
 test-stats:
 	poetry run python /root/flatnavlib/test_stats_collection.py
 
