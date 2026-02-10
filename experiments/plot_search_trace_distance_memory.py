@@ -146,6 +146,44 @@ def plot_bar(values: List[Tuple[str, float, float]], title: str, out_path: str) 
     plt.close()
 
 
+def plot_relative_bar(values: List[Tuple[str, float, float]], title: str, out_path: str) -> None:
+    labels = [v[0] for v in values]
+    trivial_vals = np.array([v[1] for v in values])
+    reuse_vals = np.array([v[2] for v in values])
+
+    scaled_trivial = np.zeros_like(trivial_vals)
+    scaled_reuse = np.ones_like(reuse_vals)
+    for idx, reuse_val in enumerate(reuse_vals):
+        if reuse_val > 0:
+            scaled_trivial[idx] = trivial_vals[idx] / reuse_val
+        else:
+            scaled_trivial[idx] = 0.0
+            scaled_reuse[idx] = 0.0
+
+    x = np.arange(len(labels))
+    width = 0.38
+
+    plt.figure(figsize=(max(10, len(labels) * 1.2), 8))
+    bars_trivial = plt.bar(x - width / 2, scaled_trivial, width, label="DM trivial offload")
+    bars_reuse = plt.bar(x + width / 2, scaled_reuse, width, label="DM reuse (baseline)")
+
+    for bar, value in zip(bars_trivial, scaled_trivial):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.2f}",
+                 ha="center", va="bottom", fontsize=8)
+    for bar, value in zip(bars_reuse, scaled_reuse):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.2f}",
+                 ha="center", va="bottom", fontsize=8)
+
+    plt.xticks(x, labels, rotation=35, ha="right")
+    plt.xlabel("Dataset")
+    plt.ylabel("Relative memory (DM reuse = 1.0)")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze search step traces and plot distance memory metrics")
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -179,6 +217,7 @@ def main() -> None:
     overall_points = []
     hub_points = []
     nonhub_points = []
+    relative_points = []
     summary_rows = []
 
     for filename in pkl_files:
@@ -193,6 +232,10 @@ def main() -> None:
         dm_trivial = bytes_to_gb(stats["total_explored"] * size_trivial)
         dm_reuse = bytes_to_gb(stats["unique_explored"] * size_reuse)
         overall_points.append((label, dm_trivial, dm_reuse))
+
+        dm_trivial_hub = bytes_to_gb(stats["total_explored_hub"] * size_trivial)
+        dm_reuse_hubs_only = bytes_to_gb(stats["unique_explored_hub"] * size_reuse)
+        relative_points.append((label, dm_trivial_hub, dm_reuse_hubs_only))
 
         dm_trivial_hub = bytes_to_gb(stats["total_explored_hub"] * size_trivial)
         dm_reuse_hub = bytes_to_gb(stats["unique_explored_hub"] * size_reuse)
@@ -251,6 +294,11 @@ def main() -> None:
         nonhub_points,
         "DM trivial offload vs DM reuse (Explored non-hubs)",
         os.path.join(args.output_dir, "dm_trivial_vs_reuse_nonhubs.png"),
+    )
+    plot_relative_bar(
+        relative_points,
+        "Relative DM trivial offload vs DM reuse (hubs-only baseline)",
+        os.path.join(args.output_dir, "dm_trivial_vs_reuse_relative_hubs_baseline.png"),
     )
 
     summary_path = os.path.join(args.output_dir, "dm_trivial_reuse_summary.json")
