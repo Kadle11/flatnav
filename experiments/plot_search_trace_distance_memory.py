@@ -111,6 +111,97 @@ def summarize_trace(trace: dict) -> dict:
     }
 
 
+def compute_reuse_stats(trace: dict) -> dict:
+    hub_map = build_hub_map(trace.get("is_hub", []))
+    per_query = []
+    for query in trace.get("queries", []):
+        search_steps = query.get("search_steps", []) or []
+        reuse_beyond_prev_count = 0
+        reuse_beyond_prev_hub_count = 0
+        reuse_beyond_prev_nonhub_count = 0
+        comparable_steps = 0
+        comparable_steps_hub = 0
+        comparable_steps_nonhub = 0
+
+        for idx in range(1, len(search_steps)):
+            prev_step = search_steps[idx - 1]
+            prev_traversed = prev_step.get("traversed_list", []) or []
+
+
+            node_id = search_steps[idx].get("node_id", None)
+            if node_id is None:
+                continue
+
+            is_hub = hub_map.get(node_id, False)
+            comparable_steps += 1
+            if is_hub:
+                comparable_steps_hub += 1
+            else:
+                comparable_steps_nonhub += 1
+            in_prev = node_id in prev_traversed
+            if not in_prev:
+                reuse_beyond_prev_count += 1
+                if is_hub:
+                    reuse_beyond_prev_hub_count += 1
+                else:
+                    reuse_beyond_prev_nonhub_count += 1
+
+        total_steps = len(search_steps)
+        reuse_beyond_prev_pct = (100.0 * reuse_beyond_prev_count / comparable_steps) if comparable_steps > 0 else 0.0
+        reuse_beyond_prev_hub_pct = (100.0 * reuse_beyond_prev_hub_count / comparable_steps) if comparable_steps > 0 else 0.0
+        reuse_beyond_prev_nonhub_pct = (100.0 * reuse_beyond_prev_nonhub_count / comparable_steps) if comparable_steps > 0 else 0.0
+
+        per_query.append(
+            {
+                "query_id": query.get("query_id"),
+                "total_steps": total_steps,
+                "comparable_steps": comparable_steps,
+                "comparable_steps_hub": comparable_steps_hub,
+                "comparable_steps_nonhub": comparable_steps_nonhub,
+                "reuse_beyond_prev_count": reuse_beyond_prev_count,
+                "reuse_beyond_prev_pct": reuse_beyond_prev_pct,
+                "reuse_beyond_prev_hub_count": reuse_beyond_prev_hub_count,
+                "reuse_beyond_prev_hub_pct": reuse_beyond_prev_hub_pct,
+                "reuse_beyond_prev_nonhub_count": reuse_beyond_prev_nonhub_count,
+                "reuse_beyond_prev_nonhub_pct": reuse_beyond_prev_nonhub_pct,
+            }
+        )
+
+    if per_query:
+        avg_total_steps = float(np.mean([q["total_steps"] for q in per_query]))
+        avg_comparable_steps = float(np.mean([q["comparable_steps"] for q in per_query]))
+        avg_reuse_beyond_prev_count = float(np.mean([q["reuse_beyond_prev_count"] for q in per_query]))
+        avg_reuse_beyond_prev_pct = float(np.mean([q["reuse_beyond_prev_pct"] for q in per_query]))
+        avg_reuse_beyond_prev_hub_count = float(np.mean([q["reuse_beyond_prev_hub_count"] for q in per_query]))
+        avg_reuse_beyond_prev_hub_pct = float(np.mean([q["reuse_beyond_prev_hub_pct"] for q in per_query]))
+        avg_reuse_beyond_prev_nonhub_count = float(np.mean([q["reuse_beyond_prev_nonhub_count"] for q in per_query]))
+        avg_reuse_beyond_prev_nonhub_pct = float(np.mean([q["reuse_beyond_prev_nonhub_pct"] for q in per_query]))
+    else:
+        avg_total_steps = 0.0
+        avg_comparable_steps = 0.0
+        avg_reuse_beyond_prev_count = 0.0
+        avg_reuse_beyond_prev_pct = 0.0
+        avg_reuse_beyond_prev_hub_count = 0.0
+        avg_reuse_beyond_prev_hub_pct = 0.0
+        avg_reuse_beyond_prev_nonhub_count = 0.0
+        avg_reuse_beyond_prev_nonhub_pct = 0.0
+
+    return {
+        "overall": {
+            "total_queries": len(per_query),
+            "avg_total_steps": avg_total_steps,
+            "avg_comparable_steps": avg_comparable_steps,
+            "avg_reuse_beyond_prev_count": avg_reuse_beyond_prev_count,
+            "avg_reuse_beyond_prev_pct": avg_reuse_beyond_prev_pct,
+            "avg_reuse_beyond_prev_hub_count": avg_reuse_beyond_prev_hub_count,
+            "avg_reuse_beyond_prev_hub_pct": avg_reuse_beyond_prev_hub_pct,
+            "avg_reuse_beyond_prev_nonhub_count": avg_reuse_beyond_prev_nonhub_count,
+            "avg_reuse_beyond_prev_nonhub_pct": avg_reuse_beyond_prev_nonhub_pct,
+        },
+        "queries": per_query,
+    }
+
+
 def bytes_trivial_offload() -> int:
     return 2*S_VERTEX_BYTES + S_DISTANCE_BYTES
 
@@ -228,6 +319,8 @@ def main() -> None:
 
         trace = load_trace(os.path.join(args.input_dir, filename))
         stats = summarize_trace(trace)
+        reuse_stats = compute_reuse_stats(trace)
+        reuse_stats["dataset"] = label
 
         dm_trivial = bytes_to_gb(stats["total_explored"] * size_trivial)
         dm_reuse = bytes_to_gb(stats["unique_explored"] * size_reuse)
@@ -269,6 +362,10 @@ def main() -> None:
                 "dm_reuse_nonhubs_gb": dm_reuse_nonhub,
             }
         )
+
+        reuse_stats_path = os.path.join(args.output_dir, f"{label}_reuse_stats.json")
+        with open(reuse_stats_path, "w", encoding="utf-8") as f:
+            json.dump(reuse_stats, f, indent=2)
 
         print(f"Dataset: {label}")
         print(f"  Total explored computations: {stats['total_explored']}")

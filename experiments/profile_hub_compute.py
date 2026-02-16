@@ -58,7 +58,7 @@ SYNTHETIC_DATASETS = [
     # "normal-128-angular",
     # "normal-128-euclidean",
     # "normal-256-angular",
-    "normal-256-euclidean",
+    # "normal-256-euclidean",
     # "normal-512-euclidean",
     # "normal-1024-angular",
     # "normal-1024-euclidean",
@@ -69,7 +69,7 @@ SYNTHETIC_DATASETS = [
 ANN_DATASETS = [
     # "glove-100-angular",
     # "nytimes-256-angular",
-    # "gist-960-euclidean",
+     "gist-960-euclidean",
     # "yandex-deep-10m-euclidean",
     # "spacev-10m-euclidean",
 ]
