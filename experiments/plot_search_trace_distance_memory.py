@@ -72,7 +72,7 @@ def summarize_trace(trace: dict) -> dict:
     for query in trace.get("queries", []):
         for step in query.get("search_steps", []):
             explored_list = step.get("explored_list", []) or []
-            traversed_list = step.get("traversed_list", []) or []
+            traversed_list = step.get("candidate_list", []) or []
 
             total_explored += len(explored_list)
             total_traversed += len(traversed_list)
@@ -125,7 +125,7 @@ def compute_reuse_stats(trace: dict) -> dict:
 
         for idx in range(1, len(search_steps)):
             prev_step = search_steps[idx - 1]
-            prev_traversed = prev_step.get("traversed_list", []) or []
+            prev_traversed = prev_step.get("candidate_list", []) or []
 
 
             node_id = search_steps[idx].get("node_id", None)
@@ -224,8 +224,8 @@ def plot_bar(values: List[Tuple[str, float, float]], title: str, out_path: str) 
     width = 0.38
 
     plt.figure(figsize=(max(10, len(labels) * 1.2), 8))
-    plt.bar(x - width / 2, trivial_vals, width, label="DM trivial offload")
-    plt.bar(x + width / 2, reuse_vals, width, label="DM reuse")
+    plt.bar(x - width / 2, trivial_vals, width, label="DM offload disabled")
+    plt.bar(x + width / 2, reuse_vals, width, label="DM offload enabled")
 
     plt.xticks(x, labels, rotation=35, ha="right")
     plt.xlabel("Dataset")
@@ -242,11 +242,11 @@ def plot_relative_bar(values: List[Tuple[str, float, float]], title: str, out_pa
     trivial_vals = np.array([v[1] for v in values])
     reuse_vals = np.array([v[2] for v in values])
 
-    scaled_trivial = np.zeros_like(trivial_vals)
-    scaled_reuse = np.ones_like(reuse_vals)
-    for idx, reuse_val in enumerate(reuse_vals):
-        if reuse_val > 0:
-            scaled_trivial[idx] = trivial_vals[idx] / reuse_val
+    scaled_trivial = np.ones_like(trivial_vals)
+    scaled_reuse = np.zeros_like(reuse_vals)
+    for idx, trivial_val in enumerate(trivial_vals):
+        if trivial_val > 0:
+            scaled_reuse[idx] = reuse_vals[idx] / trivial_val
         else:
             scaled_trivial[idx] = 0.0
             scaled_reuse[idx] = 0.0
@@ -255,8 +255,8 @@ def plot_relative_bar(values: List[Tuple[str, float, float]], title: str, out_pa
     width = 0.38
 
     plt.figure(figsize=(max(10, len(labels) * 1.2), 8))
-    bars_trivial = plt.bar(x - width / 2, scaled_trivial, width, label="DM trivial offload")
-    bars_reuse = plt.bar(x + width / 2, scaled_reuse, width, label="DM reuse (baseline)")
+    bars_trivial = plt.bar(x - width / 2, scaled_trivial, width, label="DM offload disabled (baseline)")
+    bars_reuse = plt.bar(x + width / 2, scaled_reuse, width, label="DM offload enabled")
 
     for bar, value in zip(bars_trivial, scaled_trivial):
         plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.2f}",
@@ -267,7 +267,7 @@ def plot_relative_bar(values: List[Tuple[str, float, float]], title: str, out_pa
 
     plt.xticks(x, labels, rotation=35, ha="right")
     plt.xlabel("Dataset")
-    plt.ylabel("Relative memory (DM reuse = 1.0)")
+    plt.ylabel("Relative memory (DM offload disabled = 1.0)")
     plt.title(title)
     plt.legend()
     plt.tight_layout()
@@ -370,32 +370,37 @@ def main() -> None:
         print(f"Dataset: {label}")
         print(f"  Total explored computations: {stats['total_explored']}")
         print(f"    Hubs: {stats['total_explored_hub']} | Non-hubs: {stats['total_explored_nonhub']}")
-        print(f"  Total traversed computations: {stats['total_traversed']}")
+        print(f"  Total candidate list computations: {stats['total_traversed']}")
         print(f"    Hubs: {stats['total_traversed_hub']} | Non-hubs: {stats['total_traversed_nonhub']}")
         print(f"  Unique explored computations: {stats['unique_explored']}")
         print(f"    Hubs: {stats['unique_explored_hub']} | Non-hubs: {stats['unique_explored_nonhub']}")
-        print(f"  Unique traversed computations: {stats['unique_traversed']}")
+        print(f"  Unique candidate list computations: {stats['unique_traversed']}")
         print(f"    Hubs: {stats['unique_traversed_hub']} | Non-hubs: {stats['unique_traversed_nonhub']}")
 
-    plot_bar(
+    plot_relative_bar(
         overall_points,
-        "DM trivial offload vs DM reuse (All explored computations)",
+        "Relative DM offload disabled vs enabled (All explored computations)",
         os.path.join(args.output_dir, "dm_trivial_vs_reuse_all.png"),
     )
-    plot_bar(
+    plot_relative_bar(
         hub_points,
-        "DM trivial offload vs DM reuse (Explored hubs)",
+        "Relative DM offload disabled vs enabled (Explored hubs)",
         os.path.join(args.output_dir, "dm_trivial_vs_reuse_hubs.png"),
     )
-    plot_bar(
+    plot_relative_bar(
         nonhub_points,
-        "DM trivial offload vs DM reuse (Explored non-hubs)",
+        "Relative DM offload disabled vs enabled (Explored non-hubs)",
         os.path.join(args.output_dir, "dm_trivial_vs_reuse_nonhubs.png"),
     )
     plot_relative_bar(
         relative_points,
-        "Relative DM trivial offload vs DM reuse (hubs-only baseline)",
+        "Relative DM offload disabled vs enabled (Hubs only)",
         os.path.join(args.output_dir, "dm_trivial_vs_reuse_relative_hubs_baseline.png"),
+    )
+    plot_bar(
+        overall_points,
+        "Absolute DM offload disabled vs enabled (All explored computations)",
+        os.path.join(args.output_dir, "dm_offload_disabled_vs_enabled_absolute.png"),
     )
 
     summary_path = os.path.join(args.output_dir, "dm_trivial_reuse_summary.json")

@@ -716,10 +716,15 @@ plot-search-trace-distance-memory:
 		--output-dir /root/metrics/search_step_trace/plots
 
 test-stats:
-	poetry run python /root/flatnavlib/test_stats_collection.py
+	poetry/root/root run python /root/flatnavlib/test_stats_collection.py
 
 plot-results:
 	poetry run python plot_stats_test_results.py
+
+plot-dm-trivial-reuse-horizontal:
+	poetry run python plot_dm_trivial_reuse_horizontal_bars.py \
+		--input-file /root/metrics/search_step_trace/plots/dm_trivial_reuse_summary.json \
+		--output-dir /root/metrics/search_step_trace/plots
 
 setup: install-flatnav install-hnswlib
 
