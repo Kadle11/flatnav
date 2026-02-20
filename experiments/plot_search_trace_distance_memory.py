@@ -61,6 +61,9 @@ def summarize_trace(trace: dict) -> dict:
     total_explored_nonhub = 0
     total_traversed_hub = 0
     total_traversed_nonhub = 0
+    total_unique_nodes_visited = 0
+    total_unique_hubs_visited = 0
+    total_unique_nonhubs_visited = 0
 
     unique_explored = set()
     unique_traversed = set()
@@ -70,9 +73,19 @@ def summarize_trace(trace: dict) -> dict:
     unique_traversed_nonhub = set()
 
     for query in trace.get("queries", []):
+        unique_nodes_in_query = set()
+        unique_hubs_in_query = set()
+        unique_nonhubs_in_query = set()
         for step in query.get("search_steps", []):
             explored_list = step.get("explored_list", []) or []
             traversed_list = step.get("candidate_list", []) or []
+            unique_node_id = step.get("unique_node_id", None)
+            if unique_node_id is not None:
+                unique_nodes_in_query.add(unique_node_id)
+                if hub_map.get(unique_node_id, False):
+                    unique_hubs_in_query.add(unique_node_id)
+                else:
+                    unique_nonhubs_in_query.add(unique_node_id)
 
             total_explored += len(explored_list)
             total_traversed += len(traversed_list)
@@ -94,6 +107,9 @@ def summarize_trace(trace: dict) -> dict:
                 else:
                     total_traversed_nonhub += 1
                     unique_traversed_nonhub.add(node_id)
+        total_unique_nodes_visited += len(unique_nodes_in_query)
+        total_unique_hubs_visited += len(unique_hubs_in_query)
+        total_unique_nonhubs_visited += len(unique_nonhubs_in_query)
 
     return {
         "total_explored": total_explored,
@@ -108,6 +124,9 @@ def summarize_trace(trace: dict) -> dict:
         "unique_explored_nonhub": len(unique_explored_nonhub),
         "unique_traversed_hub": len(unique_traversed_hub),
         "unique_traversed_nonhub": len(unique_traversed_nonhub),
+        "total_unique_nodes_visited": total_unique_nodes_visited,
+        "total_unique_hubs_visited": total_unique_hubs_visited,
+        "total_unique_nonhubs_visited": total_unique_nonhubs_visited,
     }
 
 
@@ -322,19 +341,22 @@ def main() -> None:
         reuse_stats = compute_reuse_stats(trace)
         reuse_stats["dataset"] = label
 
-        dm_trivial = bytes_to_gb(stats["total_explored"] * size_trivial)
+        query_vector_bytes = stats["total_unique_nodes_visited"] * (S_SCALAR_BYTES * dim)
+        query_vector_bytes_hub = stats["total_unique_hubs_visited"] * (S_SCALAR_BYTES * dim)
+        query_vector_bytes_nonhub = stats["total_unique_nonhubs_visited"] * (S_SCALAR_BYTES * dim)
+        dm_trivial = bytes_to_gb((stats["total_explored"] * size_trivial) + query_vector_bytes)
         dm_reuse = bytes_to_gb(stats["unique_explored"] * size_reuse)
         overall_points.append((label, dm_trivial, dm_reuse))
 
-        dm_trivial_hub = bytes_to_gb(stats["total_explored_hub"] * size_trivial)
+        dm_trivial_hub = bytes_to_gb((stats["total_explored_hub"] * size_trivial) + query_vector_bytes_hub)
         dm_reuse_hubs_only = bytes_to_gb(stats["unique_explored_hub"] * size_reuse)
         relative_points.append((label, dm_trivial_hub, dm_reuse_hubs_only))
 
-        dm_trivial_hub = bytes_to_gb(stats["total_explored_hub"] * size_trivial)
+        dm_trivial_hub = bytes_to_gb((stats["total_explored_hub"] * size_trivial) + query_vector_bytes_hub)
         dm_reuse_hub = bytes_to_gb(stats["unique_explored_hub"] * size_reuse)
         hub_points.append((label, dm_trivial_hub, dm_reuse_hub))
 
-        dm_trivial_nonhub = bytes_to_gb(stats["total_explored_nonhub"] * size_trivial)
+        dm_trivial_nonhub = bytes_to_gb((stats["total_explored_nonhub"] * size_trivial) + query_vector_bytes_nonhub)
         dm_reuse_nonhub = bytes_to_gb(stats["unique_explored_nonhub"] * size_reuse)
         nonhub_points.append((label, dm_trivial_nonhub, dm_reuse_nonhub))
 
@@ -354,6 +376,12 @@ def main() -> None:
                 "unique_traversed": stats["unique_traversed"],
                 "unique_traversed_hubs": stats["unique_traversed_hub"],
                 "unique_traversed_nonhubs": stats["unique_traversed_nonhub"],
+                "total_unique_nodes_visited": stats["total_unique_nodes_visited"],
+                "total_unique_hubs_visited": stats["total_unique_hubs_visited"],
+                "total_unique_nonhubs_visited": stats["total_unique_nonhubs_visited"],
+                "query_vector_bytes": query_vector_bytes,
+                "query_vector_bytes_hubs": query_vector_bytes_hub,
+                "query_vector_bytes_nonhubs": query_vector_bytes_nonhub,
                 "dm_trivial_offload_gb": dm_trivial,
                 "dm_reuse_gb": dm_reuse,
                 "dm_trivial_offload_hubs_gb": dm_trivial_hub,
