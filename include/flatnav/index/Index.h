@@ -107,6 +107,19 @@ class Index {
   // Each level represents one iteration of the beam search while loop.
   std::vector<std::vector<std::vector<std::pair<uint32_t, bool>>>> _visited_nodes_by_level;
 
+  // Structure to track individual search steps with detailed exploration info
+  struct SearchStep {
+    uint32_t node_id;           // The node being explored in this step
+    uint32_t level;             // The search level/iteration where this node was processed
+    std::set<uint32_t> explored_list;   // All nodes we computed distances for
+    std::set<uint32_t> traversed_list;  // Nodes filtered for further exploration
+  };
+
+  // Keep track of search steps with detailed exploration information
+  // Structure: [query_idx][step_idx]
+  // Each step tracks which nodes were explored and which were traversed for further expansion
+  std::vector<std::vector<SearchStep>> _visited_nodes_by_search_step;
+
   bool* _hub_nodes; // A boolean array to keep track of hub nodes.
   // If a node is a hub, then _hub_nodes[node] = true, else false.
 
@@ -327,6 +340,25 @@ class Index {
    */
   void clearVisitedNodesByLevel() {
     _visited_nodes_by_level.clear();
+  }
+
+  /**
+   * @brief Get the sequence of search steps with explored and traversed node lists.
+   * @return Vector of [query_idx][step_idx] SearchStep objects, each containing:
+   *         - node_id: the node being explored in this step
+   *         - level: the search level where this node was processed
+   *         - explored_list: all nodes we computed distances for
+   *         - traversed_list: nodes filtered for further exploration
+   */
+  std::vector<std::vector<SearchStep>> getVisitedNodesBySearchStep() {
+    return _visited_nodes_by_search_step;
+  }
+
+  /**
+   * @brief Clear the accumulated visited nodes by search step data.
+   */
+  void clearVisitedNodesBySearchStep() {
+    _visited_nodes_by_search_step.clear();
   }
 
 
@@ -1014,6 +1046,8 @@ class Index {
     std::vector<std::pair<uint32_t, bool>> query_visited_nodes_with_ids;
     // Track nodes by level: each level is one iteration of the while loop
     std::vector<std::vector<std::pair<uint32_t, bool>>> query_visited_nodes_by_level;
+    // Track search steps with explored and traversed lists
+    std::vector<SearchStep> query_search_steps;
 
     auto *visited_set = _visited_set_pool->pollAvailableSet();
     visited_set->clear();
@@ -1045,9 +1079,17 @@ class Index {
       _node_access_counts[entry_node]++;
     }
 
+    // Also track entry node as first search step
+    SearchStep entry_step;
+    entry_step.node_id = entry_node;
+    entry_step.level = 0;
+    // Entry node has no neighbors to explore, so explored_list and traversed_list are empty
+    query_search_steps.push_back(entry_step);
+
     // For true BFS-like level tracking, we need to process all candidates
     // at the same "depth" before moving to the next level.
     // We use a snapshot of candidates at the start of each level.
+    uint32_t current_level = 1;
     while (!candidates.empty()) {
       // Take a snapshot of current candidates size to process this "level"
       size_t candidates_in_this_level = candidates.size();
@@ -1073,25 +1115,124 @@ class Index {
         }
 #endif
 
-        processCandidateNodeWithIDs<is_search_stage>(
+        // Track explored and traversed lists for this search step
+        std::set<uint32_t> explored_list;
+        std::set<uint32_t> traversed_list;
+        
+        processCandidateNodeWithSearchStep<is_search_stage>(
             query, node, max_dist, buffer_size, visited_set,
             neighbors, candidates, query_visited_nodes_flags,
-            query_visited_nodes_with_ids, next_level_nodes);
+            query_visited_nodes_with_ids, next_level_nodes,
+            explored_list, traversed_list);
+        
+        // Create search step for this node
+        SearchStep step;
+        step.node_id = node;
+        step.level = current_level;
+        step.explored_list = explored_list;
+        step.traversed_list = traversed_list;
+        query_search_steps.push_back(step);
       }
       
       // Only add this level if nodes were actually processed
       if (!next_level_nodes.empty()) {
         query_visited_nodes_by_level.push_back(std::move(next_level_nodes));
       }
+      current_level++;
     }
 
     _visited_nodes_sequence.push_back(std::move(query_visited_nodes_flags));
     _visited_nodes_with_ids.push_back(std::move(query_visited_nodes_with_ids));
     _visited_nodes_by_level.push_back(std::move(query_visited_nodes_by_level));
+    _visited_nodes_by_search_step.push_back(std::move(query_search_steps));
 
     _visited_set_pool->pushVisitedSet(visited_set);
 
     return neighbors;
+  }
+
+  /**
+   * @brief Process candidate node with ID tracking AND search step tracking.
+   * Returns the explored and traversed node lists for search step profiling.
+   */
+  template <bool is_search_stage>
+  void processCandidateNodeWithSearchStep(
+      const void *query, node_id_t &node, float &max_dist,
+      const int buffer_size, VisitedSet *visited_set,
+      PriorityQueue &neighbors, PriorityQueue &candidates,
+      std::vector<bool>& query_visited_nodes_flags,
+      std::vector<std::pair<uint32_t, bool>>& query_visited_nodes_with_ids,
+      std::vector<std::pair<uint32_t, bool>>& level_nodes,
+      std::set<uint32_t>& explored_list,
+      std::set<uint32_t>& traversed_list) {
+    std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
+
+    node_id_t *neighbor_node_links = getNodeLinks(node);
+    query_visited_nodes_flags.push_back(_hub_nodes[node]);
+    query_visited_nodes_with_ids.push_back({node, _hub_nodes[node]});
+    level_nodes.push_back({node, _hub_nodes[node]});
+
+    for (uint32_t i = 0; i < _M; i++) {
+      node_id_t neighbor_node_id = neighbor_node_links[i];
+
+      if (_search_mode == SearchMode::HUB_ONLY && !_hub_nodes[neighbor_node_id]) {
+        continue;
+      }
+      if (_search_mode == SearchMode::NONHUB_ONLY && _hub_nodes[neighbor_node_id]) {
+        continue;
+      }
+
+      if (is_search_stage) {
+        _node_access_counts[neighbor_node_id]++;
+      }
+
+#ifdef USE_SSE
+      if (i != _M - 1) {
+        _mm_prefetch(getNodeData(neighbor_node_links[i + 1]), _MM_HINT_T0);
+        visited_set->prefetch(neighbor_node_links[i + 1]);
+      }
+#endif
+
+      bool neighbor_is_visited = visited_set->isVisited(neighbor_node_id);
+
+      if (neighbor_is_visited) {
+        continue;
+      }
+      visited_set->insert(neighbor_node_id);
+      
+      // Add to explored list (we computed distance for this node)
+      explored_list.insert(neighbor_node_id);
+      
+      float dist = _distance->distance(query, getNodeData(neighbor_node_id), true);
+
+      if (_collect_stats) {
+        _distance_computations.fetch_add(1);
+        bool is_hub = _hub_nodes[neighbor_node_id];
+        if (is_hub) {
+          _hub_distance_computations.fetch_add(1);
+        } else {
+          _nonhub_distance_computations.fetch_add(1);
+        }
+      }
+
+      if (neighbors.size() < buffer_size || dist < max_dist) {
+        candidates.emplace(-dist, neighbor_node_id);
+        neighbors.emplace(dist, neighbor_node_id);
+        
+        // Add to traversed list (this node will be explored further)
+        traversed_list.insert(neighbor_node_id);
+        
+#ifdef USE_SSE
+        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
+#endif
+        if (neighbors.size() > buffer_size) {
+          neighbors.pop();
+        }
+        if (!neighbors.empty()) {
+          max_dist = neighbors.top().first;
+        }
+      }
+    }
   }
 
   /**

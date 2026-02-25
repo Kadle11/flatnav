@@ -683,6 +683,18 @@ profile-hub-compute-batch-trace:
 		--num-queries 10000 \
 		--dump-search-trace
 
+generate-searchstep-trace:
+	cd .. && PYTHONPATH=/mydata/flatnav/python-build:$$PYTHONPATH poetry run python3 experiments/generate_searchstep_trace.py \
+		--dataset gist-960-euclidean \
+		--k 100 \
+		--ef-construction 40 \
+		--ef-search 100 \
+		--num-node-links 32 \
+		--hub-percentile 90 \
+		--output-path ./metrics/search_step_traces \
+		--num-queries 10000 \
+		--root-dataset-path ./data
+
 profile-hub-compute-batch-extremes:
 	poetry run python profile_hub_compute_batch.py \
 		--dataset gist-960-euclidean \

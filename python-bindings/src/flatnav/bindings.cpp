@@ -373,9 +373,47 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     _index->clearVisitedNodesByLevel();
   }
 
+  // Return search steps with explored and traversed lists
+  py::object getVisitedNodesBySearchStep() {
+    py::list result;
+    auto search_steps_by_query = _index->getVisitedNodesBySearchStep();
+    
+    for (const auto& query_steps : search_steps_by_query) {
+      py::list query_list;
+      for (const auto& step : query_steps) {
+        py::dict step_dict;
+        step_dict["node_id"] = step.node_id;
+        step_dict["level"] = step.level;
+        
+        // Convert explored_list set to Python list
+        py::list explored_py;
+        for (uint32_t node : step.explored_list) {
+          explored_py.append(node);
+        }
+        step_dict["explored_list"] = explored_py;
+        
+        // Convert traversed_list set to Python list
+        py::list traversed_py;
+        for (uint32_t node : step.traversed_list) {
+          traversed_py.append(node);
+        }
+        step_dict["traversed_list"] = traversed_py;
+        
+        query_list.append(step_dict);
+      }
+      result.append(query_list);
+    }
+    return result;
+  }
+
+  void clearVisitedNodesBySearchStep() {
+    _index->clearVisitedNodesBySearchStep();
+  }
+
   std::vector<std::vector<uint32_t>> getGraphOutdegreeTable() {
     return _index->getGraphOutdegreeTable();
   }
+
 
   uint32_t getMaxEdgesPerNode() { return _index->maxEdgesPerNode(); }
 
@@ -601,6 +639,12 @@ void bindSpecialization(py::module_& index_submodule) {
            "Returns list of [query][level][node_pairs] where each level is one beam search iteration")
       .def("clear_visited_nodes_by_level", &IndexType::clearVisitedNodesByLevel,
            "Clear the accumulated visited nodes by level data")
+      .def("get_visited_nodes_by_search_step", &IndexType::getVisitedNodesBySearchStep,
+           "Returns list of search steps with explored_list and traversed_list for each step. "
+           "Each step is a dict with: node_id, level, explored_list (nodes we computed distances for), "
+           "traversed_list (nodes filtered for further exploration)")
+      .def("clear_visited_nodes_by_search_step", &IndexType::clearVisitedNodesBySearchStep,
+           "Clear the accumulated visited nodes by search step data")
       .def(
           "search_single_with_node_ids",
           [](IndexType& index, const py::array& query, int K, int ef_search, int num_initializations = 100) {
