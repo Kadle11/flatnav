@@ -124,7 +124,6 @@ class Index {
         _max_node_count(other._max_node_count),
         _cur_num_nodes(other._cur_num_nodes),
         _distance(std::move(other._distance)),
-        _index_data_guard(std::move(other._index_data_guard)),
         _num_threads(other._num_threads),
         _visited_set_pool(std::move(other._visited_set_pool)),
         _node_links_mutexes(std::move(other._node_links_mutexes)) {
@@ -144,7 +143,6 @@ class Index {
       _max_node_count = other._max_node_count;
       _cur_num_nodes = other._cur_num_nodes;
       _distance = std::move(other._distance);
-      _index_data_guard = std::move(other._index_data_guard);
       _num_threads = other._num_threads;
       _visited_set_pool = std::move(other._visited_set_pool);
       _node_links_mutexes = std::move(other._node_links_mutexes);
