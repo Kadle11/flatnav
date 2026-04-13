@@ -66,7 +66,10 @@ def build_flatnav_index_from_hnsw_graph(
         if (end == dataset_size) or ((end // build_batch_size) % 5 == 0):
             logging.info("HNSW added %d/%d vectors", end, dataset_size)
 
-    with tempfile.NamedTemporaryFile(suffix=".mtx", delete=False) as tmp:
+    graph_tmp_dir = Path(__file__).resolve().parent
+    with tempfile.NamedTemporaryFile(
+        suffix=".mtx", delete=False, dir=graph_tmp_dir
+    ) as tmp:
         mtx_filename = tmp.name
     hnsw_index.save_base_layer_graph(filename=mtx_filename)
 
