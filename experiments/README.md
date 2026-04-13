@@ -47,13 +47,75 @@ You may also want to save the experiment logs to a file on disk. You can do so b
 ```
 > ./bin/docker-test.sh sift-bench > logs.txt 2>& 1
 ```
+
+## Running Locally with Poetry (No Docker)
+
+The Dockerfile sets up the experiments environment with Poetry and a forked `hnswlib`
+wheel. You can follow the same flow locally:
+
+```shell
+# From repo root
+cd experiments
+
+# Use the same Poetry version as Dockerfile
+python3 -m pip install --user "poetry==1.8.2"
+
+# Install project dependencies into the Poetry environment
+poetry install --no-root
+
+# Build the hnswlib wheel from the same fork used in Dockerfile
+cd ..
+git clone https://github.com/BlaiseMuhirwa/hnswlib-original.git
+cd hnswlib-original/python_bindings
+poetry run python setup.py bdist_wheel
+
+# Install the built wheel into the experiments Poetry venv and finalize installs
+cd ../../experiments
+poetry run pip install --no-deps --force-reinstall ../hnswlib-original/python_bindings/dist/*.whl
+poetry install --no-root
+```
+
+Then run a benchmark with Poetry:
+
+```shell
+cd experiments
+poetry run python run-benchmark.py \
+	--dataset-name mnist-local \
+	--dataset ../data/mnist-784-euclidean/mnist-784-euclidean.train.npy \
+	--queries ../data/mnist-784-euclidean/mnist-784-euclidean.test.npy \
+	--gtruth ../data/mnist-784-euclidean/mnist-784-euclidean.gtruth.npy \
+	--index-type flatnav \
+	--num-node-links 32 \
+	--ef-construction 100 \
+	--ef-search 100 \
+	--metric l2
+```
+
+You can also run the helper script to perform the full setup in one step:
+
+```shell
+cd experiments
+./setup-poetry-env.sh
+```
+
 ### Viewing Output Metrics
 
 Once you have run a benchmarking job to completion, the experiment runner will save a set of plots under the `metrics` directory in the top level of the `flatnav` repo. These plots include, amongst others, the latency vs. recall tradeoff curves that we report in the paper. We also save the raw data used to generate these plots in the file `metrics/metrics.json`. 
 
 ## Input Data Format
 
-Our experimental benchmark scripts require three input data arguments in numpy (`.npy`) format. 
+Our experimental benchmark scripts require three input data arguments for
+train vectors, query vectors, and ground truth. Supported train/query formats are:
+
+- `.npy` (loaded as `float32`)
+- `.fvecs` (loaded as `float32`)
+- `.bvecs`
+- `.fbin`
+- `.u8bin`
+- `.i8bin`
+
+Ground truth is expected as `.npy` or `.ivecs` depending on dataset source.
+For recall, we use top-100 neighbors by default.
 
 * A `--train` file representing the vectors of each item in the data collection used to build the search index. This is expected to be a numpy array of dimension $N \times d$ where $N$ is the database size and $d$ is the vector dimension
 
@@ -61,7 +123,103 @@ Our experimental benchmark scripts require three input data arguments in numpy (
 
 * A `--gtruth` file consisting of the true $k$ nearest neighbors for each corresponding query vector. This file is expected to be an integer numpy array of dimension $Q \times k$ where $k$ is the number of near neighbors to return (we default to 100 in our experiments). Each element of this array is expected to be an integer in the range $[0, N-1]$ representing items in the index. 
 
+Example using `.fvecs` with `.ivecs` ground truth:
+
+```shell
+cd experiments
+poetry run python run-benchmark.py \
+	--dataset-name sift-fvecs \
+	--dataset /path/to/base.fvecs \
+	--queries /path/to/query.fvecs \
+	--gtruth /path/to/groundtruth.ivecs \
+	--index-type flatnav \
+	--num-node-links 32 \
+	--ef-construction 100 \
+	--ef-search 100 \
+	--metric l2
+```
+
 ## Preparing Datasets from ANN-Benchmarks
+## SIFT-100M Benchmark Profiling with Timing & Recall
+
+For detailed profiling of SIFT-100M including index build time, peak memory, query 
+latency, and recall@100 metrics at multiple ef-search values, use the dedicated 
+benchmark profiler script:
+
+### Local Benchmarking
+
+To run locally (using `/mydata/flatnav/data` paths):
+
+```shell
+cd experiments
+poetry run python sift_benchmark_profiler.py --local \
+	--num-node-links 32 \
+	--ef-construction 100 \
+	--ef-search-values 100,200 \
+	--metric l2 \
+	--output /tmp/sift-benchmark-local.json
+```
+
+Or via Make:
+
+```shell
+cd experiments
+make sift-benchmark-profile-local
+```
+
+### Docker Benchmarking
+
+To run inside Docker (using `/root/data` paths):
+
+```shell
+cd experiments
+poetry run python sift_benchmark_profiler.py --docker \
+	--num-node-links 32 \
+	--ef-construction 100 \
+	--ef-search-values 100,200 \
+	--metric l2 \
+	--output /root/metrics/sift-benchmark.json
+```
+
+Or via Make:
+
+```shell
+cd experiments
+make sift-benchmark-profile-docker
+```
+
+### Bandwidth Profiling
+
+To measure memory bandwidth alongside the benchmark, run `pcm-memory` in a separate 
+terminal while the benchmark executes:
+
+```bash
+# Terminal 1: Start bandwidth monitor (requires root/sudo)
+sudo pcm-memory 0.5 -csv=system_bandwidth.csv
+
+# Terminal 2: Run benchmark (Docker)
+cd experiments
+sudo docker-compose run flatnav-test make sift-benchmark-profile-docker
+
+# Or run directly in Docker container:
+./bin/docker-run.sh sift-benchmark-profile-docker
+```
+
+Results include:
+- **Build Time**: Index construction time in seconds
+- **Peak Memory**: Maximum resident set size (VmPeak) in MB
+- **Search Latency**: Query time per EF-search value (milliseconds)
+- **Recall@100**: Percentage of true top-100 neighbors found at each EF-search value
+- **Queries/Sec**: Throughput metric (queries per second)
+
+### Extended EF-Search Range
+
+For a more comprehensive profiling across ef-search values [50, 100, 200, 500, 1000]:
+
+```shell
+cd experiments
+make sift-benchmark-profile-extended
+```
 
 [ANN-Benchmarks](https://github.com/erikbern/ann-benchmarks) provide HDF5 files for a standard benchmark of near-neighbor datasets, queries and ground-truth results. Our experiment runner expects `.npy` files instead of HDF5 so we provide a helper script to download ANN-Benchmarks and prepare the necessary numpy files.
 

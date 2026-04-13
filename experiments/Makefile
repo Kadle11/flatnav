@@ -423,6 +423,48 @@ sift-bench-flatnav:
 		--num-build-threads 16 \
 		--num-search-threads 1 
 
+sift-big-bench-flatnav: 
+	poetry run python run-benchmark.py \
+		--dataset-name sift \
+		--dataset /root/data/sift-128-euclidean-big/sift100m_base.fvecs \
+		--queries /root/data/sift-128-euclidean/sift-128-euclidean.test.npy \
+		--gtruth /root/data/sift-128-euclidean/sift-128-euclidean.gtruth.npy \
+		--index-type flatnav \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--ef-search 100 200 \
+		--metric l2 \
+		--num-build-threads 1 \
+		--num-search-threads 1
+
+
+sift-big-bench-flatnav:
+	poetry run python sift_big_flatnav_recall.py \
+		--dataset /root/data/sift-128-euclidean/sift-128-euclidean.train.npy \
+		--queries /root/data/sift-128-euclidean/sift-128-euclidean.test.npy \
+		--gtruth /root/data/sift-128-euclidean/sift-128-euclidean.gtruth.npy \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--ef-search 100 200 \
+		--metric l2 \
+		--num-build-threads 16 \
+		--num-search-threads 1 \
+		--k 100 \
+		--output-json /root/metrics/sift-big-flatnav-recall.json
+
+sift-big-bench-flatnav-local:
+	poetry run python sift_big_flatnav_recall.py \
+		--dataset ../data/sift-128-euclidean/sift-128-euclidean.train.npy \
+		--queries ../data/sift-128-euclidean/sift-128-euclidean.test.npy \
+		--gtruth ../data/sift-128-euclidean/sift-128-euclidean.gtruth.npy \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--ef-search 100 200 \
+		--metric l2 \
+		--num-build-threads 16 \
+		--num-search-threads 1 \
+		--k 100 \
+		--output-json ../metrics/sift-big-flatnav-recall.json
 
 sift-bench-hnsw: 
 	poetry run python run-benchmark.py \
@@ -649,6 +691,76 @@ install-hnswlib:
 cleanup:
 	rm -rf hnswlib-original 
 
+# SIFT-100M Benchmark Profiling (with timing, recall, and memory tracking)
+# Run alongside: sudo pcm-memory 0.5 -csv=system_bandwidth.csv
+
+sift-benchmark-profile-local:
+	@echo "Running SIFT-100M Benchmark (LOCAL paths, /mydata/flatnav/data)"
+	poetry run python sift_benchmark_profiler.py \
+		--local \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--num-build-threads 1 \
+		--build-batch-size 250000 \
+		--ef-search-values 100,200 \
+		--max-queries 10000 \
+		--metric l2 \
+		--output /tmp/sift-benchmark-local.json
+
+sift-benchmark-profile-docker:
+	@echo "Running SIFT-100M Benchmark (DOCKER paths, /root/data)"
+	poetry run python sift_benchmark_profiler.py \
+		--docker \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--num-build-threads 1 \
+		--build-batch-size 250000 \
+		--ef-search-values 100,200 \
+		--max-queries 10000 \
+		--metric l2 \
+		--output /root/metrics/sift-benchmark.json
+
+sift-benchmark-profile-extended:
+	@echo "Running SIFT-100M Benchmark with Extended EF-Search (DOCKER)"
+	poetry run python sift_benchmark_profiler.py \
+		--docker \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--num-build-threads 1 \
+		--build-batch-size 250000 \
+		--ef-search-values 50,100,200,500,1000 \
+		--max-queries 10000 \
+		--metric l2 \
+		--output /root/metrics/sift-benchmark-extended.json
+
+sift-benchmark-profile-docker-unsafe-16:
+	@echo "Running SIFT-100M Benchmark (DOCKER, UNSAFE 16-thread build; may crash in native FlatNav on 100M .fvecs)"
+	poetry run python sift_benchmark_profiler.py \
+		--docker \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--num-build-threads 16 \
+		--allow-unsafe-parallel-build \
+		--build-batch-size 250000 \
+		--ef-search-values 100,200 \
+		--max-queries 10000 \
+		--metric l2 \
+		--output /root/metrics/sift-benchmark-unsafe16.json
+
+sift-benchmark-profile-docker-unsafe-8:
+	@echo "Running SIFT-100M Benchmark (DOCKER, UNSAFE 8-thread build; may crash in native FlatNav on 100M .fvecs)"
+	poetry run python sift_benchmark_profiler.py \
+		--docker \
+		--num-node-links 32 \
+		--ef-construction 100 \
+		--num-build-threads 8 \
+		--allow-unsafe-parallel-build \
+		--build-batch-size 250000 \
+		--ef-search-values 100,200 \
+		--max-queries 10000 \
+		--metric l2 \
+		--output /root/metrics/sift-benchmark-unsafe8.json
+
 # If passed an invalid argument, print help message
 %:
 	@echo "Invalid argument: $@"
@@ -661,4 +773,9 @@ cleanup:
 	@echo "  generate-wheel: generate wheel for flatnav"
 	@echo "  yandex-deep-bench: run yandex-deep benchmark"
 	@echo "  sift-bench: run sift benchmark"
-	
+
+	@echo "  sift-benchmark-profile-local: SIFT-100M with timing/recall/memory (local)"
+	@echo "  sift-benchmark-profile-docker: SIFT-100M with timing/recall/memory (Docker)"
+	@echo "  sift-benchmark-profile-extended: SIFT-100M with extended EF-search range (Docker)"
+	@echo "  sift-benchmark-profile-docker-unsafe-16: SIFT-100M experimental 16-thread build (may crash)"
+	@echo "  sift-benchmark-profile-docker-unsafe-8: SIFT-100M experimental 8-thread build (may crash)"
