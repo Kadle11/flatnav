@@ -134,3 +134,11 @@ poetry run python sift_benchmark_profiler.py --local \
 - Script location: `/mydata/flatnav/experiments/sift_benchmark_profiler.py`
 - Make targets: See `/mydata/flatnav/experiments/Makefile` (lines ~710-750)
 - Documentation: `/mydata/flatnav/experiments/README.md` (SIFT-100M section)
+
+## SIFT100M Extra Query Ground Truth
+
+For exact FAISS ground-truth generation of `sift100m_200k_extra_query.fvecs`, including
+resource-optimized commands (75% and max CPU), NUMA guidance, and validation interpretation,
+see:
+
+- `/mydata/flatnav/experiments/README.md` under **Generating Exact Ground Truth for SIFT100M Extra Queries**

@@ -221,6 +221,77 @@ cd experiments
 make sift-benchmark-profile-extended
 ```
 
+## Generating Exact Ground Truth for SIFT100M Extra Queries
+
+For `sift100m_200k_extra_query.fvecs`, use the FAISS-based exact generator:
+
+`/mydata/flatnav/tools/generate_faiss_ground_truth.py`
+
+This implementation is exact and memory-safe for large datasets because it:
+
+- Reads base vectors in chunks (`--base-batch-size`)
+- Searches queries in batches (`--query-batch-size`)
+- Merges nearest neighbors by distance across all base chunks
+- Streams only final merged neighbors to output `.ivecs`
+
+### Recommended Run (75% CPU on 40 logical CPUs)
+
+```bash
+cd /mydata/flatnav/experiments && \
+OMP_NUM_THREADS=30 numactl --interleave=all --physcpubind=0-29 \
+poetry run python ../tools/generate_faiss_ground_truth.py \
+	--base-fvecs ../data/sift-128-euclidean-big/sift100m_base.fvecs \
+	--queries-fvecs ../data/sift-128-euclidean-big/sift100m_200k_extra_query.fvecs \
+	--output-ivecs ../data/sift-128-euclidean-big/sift100m_200k_extra_query.gtruth.ivecs \
+	--k 100 \
+	--base-batch-size 350000 \
+	--query-batch-size 10000 \
+	--threads 30 \
+	--validate-after-run \
+	--validation-queries 200 \
+	--validation-seed 42
+```
+
+### Recommended Run (Maximum Throughput)
+
+```bash
+cd /mydata/flatnav/experiments && \
+OMP_NUM_THREADS=40 numactl --interleave=all --physcpubind=0-39 \
+poetry run python ../tools/generate_faiss_ground_truth.py \
+	--base-fvecs ../data/sift-128-euclidean-big/sift100m_base.fvecs \
+	--queries-fvecs ../data/sift-128-euclidean-big/sift100m_200k_extra_query.fvecs \
+	--output-ivecs ../data/sift-128-euclidean-big/sift100m_200k_extra_query.gtruth.ivecs \
+	--k 100 \
+	--base-batch-size 400000 \
+	--query-batch-size 10000 \
+	--threads 40 \
+	--validate-after-run \
+	--validation-queries 200 \
+	--validation-seed 42
+```
+
+### How to Interpret Validation Accuracy
+
+With `--validate-after-run`, the script recomputes exact neighbors for a sampled subset
+of queries and compares them with what was written to output.
+
+It reports:
+
+- `exact-order`: percent of sampled queries with exact neighbor list match in order
+- `set-recall@k`: percent overlap ignoring order
+
+Expected for a correct run:
+
+- `exact-order=100.000%`
+- `set-recall@100=100.000%`
+
+### Tuning Notes
+
+- If throughput drops due to bandwidth saturation, lower `--threads` first (for example 40 -> 32).
+- If memory pressure increases, lower `--base-batch-size` (for example 400000 -> 300000).
+- Keep `--query-batch-size` around 5000 to 20000 for stable memory use.
+- Prefer `numactl --interleave=all` on dual-socket systems for this memory-bound workload.
+
 [ANN-Benchmarks](https://github.com/erikbern/ann-benchmarks) provide HDF5 files for a standard benchmark of near-neighbor datasets, queries and ground-truth results. Our experiment runner expects `.npy` files instead of HDF5 so we provide a helper script to download ANN-Benchmarks and prepare the necessary numpy files.
 
 To generate an [ANNS benchmark datasets](https://github.com/erikbern/ann-benchmarks?tab=readme-ov-file#data-sets), run the following script
