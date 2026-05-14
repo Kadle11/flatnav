@@ -177,7 +177,7 @@ poetry run python sift_big_flatnav_recall.py \
   --save-mtx ../data/sift100m_hnsw_base_layer.mtx \
   --output-json ../data/sift100m_recall_no_faiss.json
 ```
-
+Build time of the graph can take a few hours so saving it the first time helps reducing the benchmarking time overall
 When complete, press `Ctrl+C` in Terminal 1 to stop pcm-memory. The CSV captures bandwidth during both graph construction and query search phases.
 
 ## Step 6: Run With FAISS Validation Enabled
