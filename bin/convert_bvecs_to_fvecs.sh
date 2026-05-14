@@ -29,9 +29,9 @@ def convert_bvecs_to_fvecs(input_file, output_file):
             f.write(vec_data.tobytes())
             if i % 10000000 == 0: print(f"Processed {i} vectors...")
 
-#convert_bvecs_to_fvecs('bigann_query.bvecs', 'sift100m_query.fvecs')
-#convert_bvecs_to_fvecs('sift100m_base.bvecs', 'sift100m_base.fvecs')
-convert_bvecs_to_fvecs('extra_queries_200k.bvecs', 'sift100m_200k_extra_query.fvecs')
+convert_bvecs_to_fvecs('bigann_query.bvecs', 'sift100m_query.fvecs')
+convert_bvecs_to_fvecs('sift100m_base.bvecs', 'sift100m_base.fvecs')
+#convert_bvecs_to_fvecs('extra_queries_200k.bvecs', 'sift100m_200k_extra_query.fvecs')
 EOF
 
 echo "Done. Base file: sift100m_base.fvecs (~48GB)"
