@@ -413,10 +413,7 @@ poetry run python ../tools/generate_faiss_ground_truth.py \
 	--k 100 \
 	--base-batch-size 400000 \
 	--query-batch-size 10000 \
-	--threads 40 \
-	--validate-after-run \
-	--validation-queries 200 \
-	--validation-seed 42
+	--threads 40 
 ```
 
 ### How to Interpret Validation Accuracy
