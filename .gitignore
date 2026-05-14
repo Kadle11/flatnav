@@ -31,3 +31,5 @@ external/openmp
 
 # Python wheels 
 wheelhouse
+
+hnswlib-original/
