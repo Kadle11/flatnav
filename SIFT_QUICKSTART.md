@@ -168,13 +168,13 @@ poetry run python sift_big_flatnav_recall.py \
   --queries ../data/sift100m_query.fvecs \
   --gtruth ../data/bigann_gnd_100M.ivecs \
   --metric l2 \
-  --num-node-links 32 \
+  --num-node-links 16 \
   --ef-construction 200 \
-  --ef-search 100 200 500 1000 \
-  --num-build-threads 1 \
-  --num-search-threads 30 \
+  --ef-search 100 200 500 \
+  --num-build-threads 16 \
+  --num-search-threads 16 \
   --build-batch-size 250000 \
-  --save-mtx ../data/sift100m_hnsw_base_layer.mtx \
+  --save-mtx ../data/sift100m_m16_hnsw_base_layer.mtx \
   --output-json ../data/sift100m_recall_no_faiss.json
 ```
 Build time of the graph can take a few hours so saving it the first time helps reducing the benchmarking time overall

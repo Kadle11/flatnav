@@ -129,8 +129,26 @@ class NpyDatasetLoader(DatasetLoader):
             train_dataset = np.load(self.train_dataset_path).astype(
                 np.float32, copy=False
             )
-        queries = np.load(self.queries_path).astype(np.float32, copy=False)
-        ground_truth = np.load(self.ground_truth_path).astype(np.int32, copy=False)
+
+        if self.queries_path.endswith(".npy"):
+            queries = np.load(self.queries_path).astype(np.float32, copy=False)
+        elif self.queries_path.endswith(".fvecs"):
+            queries = read_fvecs_file(self.queries_path)
+        elif self.queries_path.endswith(".bvecs"):
+            queries = read_bvecs_file(self.queries_path)
+        else:
+            raise ValueError(
+                "Invalid file extension for queries. Expected .npy, .fvecs, or .bvecs"
+            )
+
+        if self.ground_truth_path.endswith(".npy"):
+            ground_truth = np.load(self.ground_truth_path).astype(np.int32, copy=False)
+        elif self.ground_truth_path.endswith(".ivecs"):
+            ground_truth = read_ivecs_file(self.ground_truth_path)
+        else:
+            raise ValueError(
+                "Invalid file extension for ground truth. Expected .npy or .ivecs"
+            )
         return train_dataset, queries, ground_truth
 
 

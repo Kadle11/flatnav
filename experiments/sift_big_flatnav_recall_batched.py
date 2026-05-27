@@ -37,85 +37,29 @@ def _to_float32_contiguous(batch: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(batch, dtype=np.float32)
 
 
-def run_faiss_flatl2_validation(
-    train_data: np.ndarray,
-    queries: np.ndarray,
-    ground_truth: np.ndarray,
-    k: int,
-    max_queries: int,
-    num_threads: int,
-    progress_interval: int = 1000,
-) -> Dict[str, object]:
-    try:
-        import faiss  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "FAISS is required for --validate-faiss-flatl2. Install with `pip install faiss-cpu`."
-        ) from exc
+def _sorted_row_fraction(values: np.ndarray) -> float:
+    if values.ndim != 2 or values.shape[1] < 2:
+        return 0.0
+    deltas = np.diff(values, axis=1)
+    return float(np.mean(np.all(deltas >= 0, axis=1)))
 
-    faiss_threads = max(1, num_threads)
-    try:
-        faiss.omp_set_num_threads(faiss_threads)
-    except AttributeError:
-        logging.warning("FAISS does not expose omp_set_num_threads; using library default thread count.")
 
-    eval_queries = len(queries)
-    if max_queries > 0:
-        eval_queries = min(eval_queries, max_queries)
+def _select_labels_from_search_result(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    first_sorted = _sorted_row_fraction(first)
+    second_sorted = _sorted_row_fraction(second)
 
-    if eval_queries <= 0:
-        return {
-            "enabled": True,
-            "executed": False,
-            "reason": "No queries available for FAISS validation.",
-        }
+    if first_sorted < second_sorted:
+        return first
+    if second_sorted < first_sorted:
+        return second
 
-    faiss_index = faiss.IndexFlatL2(train_data.shape[1])
-    faiss_index.add(_to_float32_contiguous(train_data))
-    recalls: List[float] = []
-    batch_size = max(1, progress_interval)
-
-    for start in range(0, eval_queries, batch_size):
-        end = min(start + batch_size, eval_queries)
-        _, faiss_neighbors = faiss_index.search(
-            _to_float32_contiguous(queries[start:end]),
-            k,
-        )
-
-        recalls.extend(
-            compute_recall_at_k(faiss_neighbors[i], ground_truth[start + i], k)
-            for i in range(end - start)
-        )
-
-        if (end % progress_interval == 0) or (end == eval_queries):
-            logging.info("FAISS validation processed %d/%d queries", end, eval_queries)
-
-    avg_recall = float(np.mean(recalls)) if recalls else 0.0
-    min_recall = float(np.min(recalls)) if recalls else 0.0
-    max_recall = float(np.max(recalls)) if recalls else 0.0
-
-    if avg_recall < 0.99:
-        verdict = (
-            "Provided ground truth is inconsistent with FAISS exact L2 neighbors. "
-            "This indicates a data/ground-truth mismatch rather than FlatNav graph quality."
-        )
-    else:
-        verdict = (
-            "Provided ground truth matches FAISS exact L2 neighbors. "
-            "Recall calculation logic is likely correct."
-        )
-
-    return {
-        "enabled": True,
-        "executed": True,
-        "num_threads": int(faiss_threads),
-        "num_queries_evaluated": int(eval_queries),
-        "k": int(k),
-        "avg_recall_vs_provided_ground_truth": avg_recall,
-        "min_recall_vs_provided_ground_truth": min_recall,
-        "max_recall_vs_provided_ground_truth": max_recall,
-        "verdict": verdict,
-    }
+    # If both look similarly sorted, prefer the array with integer dtype; otherwise
+    # preserve the original binding order from the C++ implementation.
+    if np.issubdtype(first.dtype, np.integer) and not np.issubdtype(second.dtype, np.integer):
+        return first
+    if np.issubdtype(second.dtype, np.integer) and not np.issubdtype(first.dtype, np.integer):
+        return second
+    return first
 
 
 def build_flatnav_index_from_graph_file(
@@ -226,7 +170,7 @@ def build_flatnav_index_from_hnsw_graph(
     return index, time.time() - build_start
 
 
-def run_recall_only(
+def run_recall_only_batched(
     dataset_path: str,
     queries_path: str,
     gtruth_path: str,
@@ -242,9 +186,7 @@ def run_recall_only(
     existing_mtx: str,
     num_queries: int,
     k: int,
-    validate_faiss_flatl2: bool,
-    faiss_validate_queries: int,
-    faiss_num_threads: int,
+    search_batch_size: int = 128,
     search_only: bool = False,
     exp_id: str = "",
 ) -> Dict[str, object]:
@@ -270,43 +212,6 @@ def run_recall_only(
     if effective_k <= 0:
         raise ValueError("Ground truth has no neighbors to evaluate recall.")
 
-    faiss_validation: Dict[str, object] = {
-        "enabled": False,
-        "executed": False,
-        "reason": "Validation not requested.",
-    }
-
-    if validate_faiss_flatl2:
-        if metric != "l2":
-            faiss_validation = {
-                "enabled": True,
-                "executed": False,
-                "reason": "--validate-faiss-flatl2 only supports metric=l2.",
-            }
-            logging.warning(faiss_validation["reason"])
-        else:
-            effective_faiss_threads = (
-                num_search_threads if faiss_num_threads <= 0 else faiss_num_threads
-            )
-            logging.info(
-                "Running FAISS FlatL2 validation on up to %d queries with %d thread(s)",
-                faiss_validate_queries if faiss_validate_queries > 0 else len(queries),
-                effective_faiss_threads,
-            )
-            faiss_validation = run_faiss_flatl2_validation(
-                train_data=train_data,
-                queries=queries,
-                ground_truth=ground_truth,
-                k=effective_k,
-                max_queries=faiss_validate_queries,
-                num_threads=effective_faiss_threads,
-            )
-            logging.info(
-                "FAISS validation avg recall@%d vs provided ground truth: %.6f",
-                effective_k,
-                faiss_validation.get("avg_recall_vs_provided_ground_truth", 0.0),
-            )
-
     if existing_mtx:
         mtx_path = Path(existing_mtx).expanduser().resolve()
         if not mtx_path.is_file():
@@ -318,12 +223,6 @@ def run_recall_only(
             mtx_filename=str(mtx_path),
         )
     else:
-        if num_build_threads != 1:
-            logging.warning(
-                "num_build_threads=%d requested. If you still hit native crashes, retry with --num-build-threads 1.",
-                num_build_threads,
-            )
-
         index, build_time_sec = build_flatnav_index_from_hnsw_graph(
             train_data=train_data,
             metric=metric,
@@ -336,78 +235,68 @@ def run_recall_only(
         )
     logging.info("Build complete in %.2f sec", build_time_sec)
 
-    # Memory optimization: if existing_mtx is used, the base nodes might be memory mapped or we can at least invoke gc
     gc.collect()
 
     index.set_num_threads(num_search_threads)
     logging.info("Set FlatNav search threads to %d", num_search_threads)
-    
+
     if search_only and exp_id:
         os.makedirs("/tmp/measurement", exist_ok=True)
         ready_file = f"/tmp/measurement/{exp_id}.ready"
         logging.info("Signaling ready for measurement at %s", ready_file)
         Path(ready_file).touch()
-        # Sleep slightly to let the polling script detect and attach
         time.sleep(1)
     else:
-        logging.info("Running sequential queries without signaling for search-only benchmarking.")
+        logging.info("Running batched queries without signaling for search-only benchmarking.")
 
     results: Dict[str, Dict[str, float]] = {}
 
     for ef_search in ef_search_values:
-        logging.info("Running sequential queries with ef_search=%d", ef_search)
+        logging.info("Running batched queries with ef_search=%d", ef_search)
         start = time.time()
-        recalls = []
-        failed_queries = 0
+        recalls: List[float] = []
+        times_ms: List[float] = []
+        failed_batches = 0
         num_queries_total = len(queries)
-        progress_checkpoints = {
-            max(1, int(round((num_queries_total * step) / 10.0)))
-            for step in range(1, 11)
-        }
 
-        for i, query in enumerate(queries):
+        for start_idx in range(0, num_queries_total, search_batch_size):
+            end_idx = min(start_idx + search_batch_size, num_queries_total)
+            batch = queries[start_idx:end_idx]
             try:
-                _, neighbors = index.search_single(
-                    query=query,
-                    ef_search=ef_search,
-                    K=effective_k,
-                    num_initializations=100,
-                )
-            except RuntimeError:
-                failed_queries += 1
-                continue
-            recalls.append(compute_recall_at_k(neighbors, ground_truth[i], effective_k))
+                t0 = time.perf_counter()
+                res0, res1 = index.search(queries=batch, K=effective_k, ef_search=ef_search, num_initializations=100)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                per_query_ms = dt_ms / float(end_idx - start_idx)
+                times_ms.extend([per_query_ms] * (end_idx - start_idx))
 
-            processed = i + 1
-            if processed in progress_checkpoints:
-                running_avg_recall = float(np.mean(recalls)) if recalls else 0.0
-                logging.info(
-                    "Processed %d/%d queries, running_recall@%d=%.6f, failed=%d",
-                    processed,
-                    num_queries_total,
-                    effective_k,
-                    running_avg_recall,
-                    failed_queries,
-                )
+                batch_labels = _select_labels_from_search_result(res0, res1)
+
+                # batch_labels shape should be (batch_size, K)
+                for j in range(end_idx - start_idx):
+                    recalls.append(compute_recall_at_k(batch_labels[j], ground_truth[start_idx + j], effective_k))
+            except RuntimeError:
+                failed_batches += 1
+                continue
 
         total_sec = time.time() - start
         avg_recall = float(np.mean(recalls)) if recalls else 0.0
         results[str(ef_search)] = {
             "recall": avg_recall,
             "total_time_sec": total_sec,
-            "avg_time_ms_per_query": (total_sec * 1000.0) / max(1, len(queries)),
-            "failed_queries": failed_queries,
+            "avg_time_ms_per_query": float(np.mean(times_ms)) if times_ms else 0.0,
+            "p99_time_ms": float(np.percentile(times_ms, 99)) if times_ms else 0.0,
+            "failed_batches": failed_batches,
         }
         logging.info(
-            "ef_search=%d recall@%d=%.6f total_time=%.2fs failed=%d",
+            "ef_search=%d recall@%d=%.6f total_time=%.2fs failed_batches=%d p99_ms=%.3f",
             ef_search,
             effective_k,
             avg_recall,
             total_sec,
-            failed_queries,
+            failed_batches,
+            results[str(ef_search)]["p99_time_ms"],
         )
 
-    # Explicitly release native resources to reduce teardown-related native errors.
     del index
     gc.collect()
 
@@ -425,78 +314,30 @@ def run_recall_only(
         "num_search_threads": num_search_threads,
         "k": effective_k,
         "build_time_sec": build_time_sec,
-        "faiss_flatl2_validation": faiss_validation,
         "results": results,
     }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build FlatNav and run sequential query recall only."
+        description="Build FlatNav and run batched query recall with p99 timings."
     )
-    parser.add_argument(
-        "--dataset",
-        required=True,
-        help="Path to training dataset (.fvecs/.npy/.bin supported by data_loader).",
-    )
-    parser.add_argument("--queries", required=True, help="Path to queries file.")
-    parser.add_argument("--gtruth", required=True, help="Path to ground-truth file.")
-    parser.add_argument("--metric", default="l2", choices=["l2", "angular"])
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--queries", required=True)
+    parser.add_argument("--gtruth", required=True)
+    parser.add_argument("--metric", default="l2", choices=["l2", "angular"]) 
     parser.add_argument("--num-node-links", type=int, default=32)
     parser.add_argument("--ef-construction", type=int, default=100)
     parser.add_argument("--ef-search", nargs="+", type=int, default=[100, 200])
     parser.add_argument("--num-build-threads", type=int, default=1)
     parser.add_argument("--num-search-threads", type=int, default=1)
-    parser.add_argument(
-        "--build-batch-size",
-        type=int,
-        default=250000,
-        help="Number of vectors per HNSW add batch.",
-    )
-    parser.add_argument(
-        "--graph-tmp-dir",
-        default=str(Path(tempfile.gettempdir()).resolve()),
-        help="Directory where temporary .mtx graph is written. Use a fast local SSD path.",
-    )
-    parser.add_argument(
-        "--existing-mtx",
-        default="",
-        help="Optional path to a prebuilt HNSW base-layer .mtx graph. If set, HNSW build/dump is skipped.",
-    )
-    parser.add_argument(
-        "--save-mtx",
-        default="",
-        help="Optional path to persist generated HNSW base-layer .mtx for reuse in future runs.",
-    )
-    parser.add_argument(
-        "--num-queries",
-        type=int,
-        default=0,
-        help="Optional query limit for faster runs (0 means all).",
-    )
+    parser.add_argument("--build-batch-size", type=int, default=250000)
+    parser.add_argument("--graph-tmp-dir", default=str(Path(tempfile.gettempdir()).resolve()))
+    parser.add_argument("--existing-mtx", default="")
+    parser.add_argument("--save-mtx", default="")
+    parser.add_argument("--num-queries", type=int, default=0)
     parser.add_argument("--k", type=int, default=100)
-    parser.add_argument(
-        "--validate-faiss-flatl2",
-        action="store_true",
-        help="Validate provided ground truth using FAISS IndexFlatL2.",
-    )
-    parser.add_argument(
-        "--faiss-validate-queries",
-        type=int,
-        default=1000,
-        help="Maximum number of queries used for FAISS validation (0 means all).",
-    )
-    parser.add_argument(
-        "--faiss-num-threads",
-        type=int,
-        default=0,
-        help="Thread count for FAISS validation (0 means use --num-search-threads).",
-    )
-    parser.add_argument(
-        "--output-json",
-        default="",
-        help="Optional output path to save results as JSON.",
-    )
+    parser.add_argument("--search-batch-size", type=int, default=128)
     parser.add_argument(
         "--search-only",
         action="store_true",
@@ -507,6 +348,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Experiment ID for the /tmp/measurement/ file if --search-only is used.",
     )
+    parser.add_argument("--output-json", default="")
     return parser.parse_args()
 
 
@@ -514,7 +356,7 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    summary = run_recall_only(
+    summary = run_recall_only_batched(
         dataset_path=args.dataset,
         queries_path=args.queries,
         gtruth_path=args.gtruth,
@@ -530,9 +372,7 @@ def main() -> None:
         existing_mtx=args.existing_mtx,
         num_queries=args.num_queries,
         k=args.k,
-        validate_faiss_flatl2=args.validate_faiss_flatl2,
-        faiss_validate_queries=args.faiss_validate_queries,
-        faiss_num_threads=args.faiss_num_threads,
+        search_batch_size=args.search_batch_size,
         search_only=args.search_only,
         exp_id=args.exp_id,
     )
