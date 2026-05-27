@@ -742,11 +742,6 @@ class Index {
     query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);  
     visited_set->insert(entry_node);
 
-    // Increment the counter in the visited map for the entry point node
-    if (is_search_stage) {
-      _node_access_counts[entry_node]++;
-    }
-
     while (!candidates.empty()) {
       auto [distance, node] = candidates.top();
 
@@ -776,7 +771,6 @@ class Index {
           /* query_visited_nodes = */ query_visited_nodes_flags);
       
     }
-    _visited_nodes_sequence.push_back(std::move(query_visited_nodes_flags));
 
     _visited_set_pool->pushVisitedSet(
         /* visited_set = */ visited_set);
@@ -796,13 +790,6 @@ class Index {
     query_visited_nodes_flags.push_back(_hub_nodes[node]);  
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
-
-      if (is_search_stage) {
-        // Collect node access counts statistics. We will assume that we are in
-        // a single-threaded environment so we don't need to lock the access
-        // counts.
-        _node_access_counts[neighbor_node_id]++;
-      }
 
       // If using SSE, prefetch the next neighbor node data and the visited
       // marker

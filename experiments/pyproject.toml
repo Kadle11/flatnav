@@ -17,7 +17,7 @@ matplotlib = "^3.8.2"
 seaborn = "^0.13.1"
 scikit-learn = "^1.5.0"
 flatnav = {path = "/mydata/flatnav/python-bindings/dist/flatnav-0.1.2-cp311-cp311-linux_x86_64.whl"}
-faiss-cpu = "^1.13.2"
+faiss-cpu = "^1.14.2"
 hnswlib = {path = "/mydata/flatnav/hnswlib-original/python_bindings/dist/hnswlib-0.8.0-cp311-cp311-linux_x86_64.whl"}
 
 [build-system]

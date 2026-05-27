@@ -44,24 +44,6 @@ def _sorted_row_fraction(values: np.ndarray) -> float:
     return float(np.mean(np.all(deltas >= 0, axis=1)))
 
 
-def _select_labels_from_search_result(first: np.ndarray, second: np.ndarray) -> np.ndarray:
-    first_sorted = _sorted_row_fraction(first)
-    second_sorted = _sorted_row_fraction(second)
-
-    if first_sorted < second_sorted:
-        return first
-    if second_sorted < first_sorted:
-        return second
-
-    # If both look similarly sorted, prefer the array with integer dtype; otherwise
-    # preserve the original binding order from the C++ implementation.
-    if np.issubdtype(first.dtype, np.integer) and not np.issubdtype(second.dtype, np.integer):
-        return first
-    if np.issubdtype(second.dtype, np.integer) and not np.issubdtype(first.dtype, np.integer):
-        return second
-    return first
-
-
 def build_flatnav_index_from_graph_file(
     train_data: np.ndarray,
     metric: str,
@@ -269,11 +251,12 @@ def run_recall_only_batched(
                 per_query_ms = dt_ms / float(end_idx - start_idx)
                 times_ms.extend([per_query_ms] * (end_idx - start_idx))
 
-                batch_labels = _select_labels_from_search_result(res0, res1)
+                batch_labels = res0.astype(np.int32)
 
                 # batch_labels shape should be (batch_size, K)
                 for j in range(end_idx - start_idx):
                     recalls.append(compute_recall_at_k(batch_labels[j], ground_truth[start_idx + j], effective_k))
+    
             except RuntimeError:
                 failed_batches += 1
                 continue
@@ -286,15 +269,17 @@ def run_recall_only_batched(
             "avg_time_ms_per_query": float(np.mean(times_ms)) if times_ms else 0.0,
             "p99_time_ms": float(np.percentile(times_ms, 99)) if times_ms else 0.0,
             "failed_batches": failed_batches,
+            "qps": num_queries_total / total_sec if total_sec > 0 else 0.0,
         }
         logging.info(
-            "ef_search=%d recall@%d=%.6f total_time=%.2fs failed_batches=%d p99_ms=%.3f",
+            "ef_search=%d recall@%d=%.6f total_time=%.2fs failed_batches=%d p99_ms=%.3f qps=%.2f",
             ef_search,
             effective_k,
             avg_recall,
             total_sec,
             failed_batches,
             results[str(ef_search)]["p99_time_ms"],
+            num_queries_total / total_sec if total_sec > 0 else 0.0,
         )
 
     del index
