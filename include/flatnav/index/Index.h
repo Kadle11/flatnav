@@ -49,6 +49,7 @@ class Index {
       return a.first < b.first;
     }
   };
+  static constexpr CompareByFirst cmp{};
 
   typedef std::priority_queue<dist_node_t, std::vector<dist_node_t>, CompareByFirst> PriorityQueue;
 
@@ -388,19 +389,18 @@ class Index {
     PriorityQueue neighbors = beamSearch(/* query = */ query,
                                          /* entry_node = */ entry_node,
                                          /* buffer_size = */ std::max(ef_search, K));
-    auto size = neighbors.size();
-    std::vector<dist_label_t> results;
-    results.reserve(size);
-    while (!neighbors.empty()) {
-      auto [distance, node_id] = neighbors.top();
-      auto label = *getNodeLabel(node_id);
-      results.emplace_back(distance, label);
+    
+    while (neighbors.size() > static_cast<size_t>(K)) {
       neighbors.pop();
     }
-    std::sort(results.begin(), results.end(),
-              [](const dist_label_t& left, const dist_label_t& right) { return left.first < right.first; });
-    if (results.size() > static_cast<size_t>(K)) {
-      results.resize(K);
+
+    auto result_size = neighbors.size();
+    std::vector<dist_label_t> results(result_size);
+
+    for (size_t i = result_size; i-- > 0;) {
+      auto [dist, node_id] = neighbors.top();
+      results[i] = {dist, *(getNodeLabel(node_id))};
+      neighbors.pop();
     }
 
     return results;
@@ -604,7 +604,9 @@ class Index {
   PriorityQueue beamSearch(const void* query, const node_id_t entry_node, 
           const int buffer_size) {
     PriorityQueue neighbors;
-    PriorityQueue candidates;
+
+    thread_local std::vector<dist_node_t> candidates;
+    candidates.clear();
 
     auto* visited_set = _visited_set_pool->pollAvailableSet();
     visited_set->clear();
@@ -618,17 +620,19 @@ class Index {
                                      /* asymmetric = */ true);
 
     float max_dist = dist;
-    candidates.emplace(-dist, entry_node);
+    candidates.emplace_back(-dist, entry_node);
+    std::push_heap(candidates.begin(), candidates.end(), cmp);
     neighbors.emplace(dist, entry_node);
     visited_set->insert(entry_node);
 
     while (!candidates.empty()) {
-      auto [distance, node] = candidates.top();
+      auto [distance, node] = candidates.front();
 
       if (-distance > max_dist && neighbors.size() >= buffer_size) {
         break;
       }
-      candidates.pop();
+      std::pop_heap(candidates.begin(), candidates.end(), cmp);
+      candidates.pop_back();
 
       // Prefetching the next candidate node data and visited set marker
       // before processing it. Note that this might not be useful if the current
@@ -638,8 +642,8 @@ class Index {
       // it's probably worth it.
 #ifdef USE_SSE
       if (!candidates.empty()) {
-        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
-        visited_set->prefetch(candidates.top().second);
+        _mm_prefetch(getNodeData(candidates.front().second), _MM_HINT_T0);
+        visited_set->prefetch(candidates.front().second);
       }
 #endif
 
@@ -657,7 +661,7 @@ class Index {
   }
 
   void processCandidateNode(const void* query, node_id_t& node, float& max_dist, const int buffer_size,
-                            VisitedSet* visited_set, PriorityQueue& neighbors, PriorityQueue& candidates) {
+                            VisitedSet* visited_set, PriorityQueue& neighbors, std::vector<dist_node_t>& candidates) {
     // Lock all operations on this specific node
     std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
 
@@ -689,10 +693,11 @@ class Index {
       }
 
       if (neighbors.size() < buffer_size || dist < max_dist) {
-        candidates.emplace(-dist, neighbor_node_id);
+        candidates.emplace_back(-dist, neighbor_node_id);
+        std::push_heap(candidates.begin(), candidates.end(), cmp);
         neighbors.emplace(dist, neighbor_node_id);
 #ifdef USE_SSE
-        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
+        _mm_prefetch(getNodeData(candidates.front().second), _MM_HINT_T0);
 #endif
         if (neighbors.size() > buffer_size) {
           neighbors.pop();

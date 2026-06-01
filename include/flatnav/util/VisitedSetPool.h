@@ -19,6 +19,8 @@ class VisitedSet {
   uint8_t* _table;
   uint32_t _table_size;
 
+  std::vector<uint32_t> _dirty;
+
  public:
   VisitedSet(const uint32_t size) : _mark(1), _table_size(size) {
     // initialize values to 0
@@ -33,16 +35,24 @@ class VisitedSet {
 
   inline uint8_t getMark() const { return _mark; }
 
-  inline void insert(const uint32_t num) { _table[num] = _mark; }
+  inline void insert(const uint32_t num) {
+    if (_table[num] != _mark) {
+      _table[num] = _mark;
+      _dirty.push_back(num);
+    }
+  }
 
   inline uint32_t size() const { return _table_size; }
 
   inline void clear() {
     _mark++;
     if (_mark == 0) {
-      std::memset(_table, 0, _table_size);
+      for (uint32_t num : _dirty) {
+        _table[num] = 0;
+      }
       _mark = 1;
     }
+    _dirty.clear();
   }
 
   inline bool isVisited(const uint32_t num) const { return _table[num] == _mark; }
@@ -50,7 +60,8 @@ class VisitedSet {
   ~VisitedSet() { delete[] _table; }
 
   // copy constructor
-  VisitedSet(const VisitedSet& other) : _table_size(other._table_size), _mark(other._mark) {
+  VisitedSet(const VisitedSet& other)
+      : _table_size(other._table_size), _mark(other._mark), _dirty(other._dirty) {
 
     _table = new uint8_t[_table_size];
     std::memcpy(_table, other._table, _table_size);
@@ -58,7 +69,10 @@ class VisitedSet {
 
   // move constructor
   VisitedSet(VisitedSet&& other) noexcept
-      : _table_size(other._table_size), _mark(other._mark), _table(other._table) {
+      : _table_size(other._table_size),
+        _mark(other._mark),
+        _table(other._table),
+        _dirty(std::move(other._dirty)) {
     other._table = nullptr;
     other._table_size = 0;
     other._mark = 0;
@@ -72,6 +86,7 @@ class VisitedSet {
       _mark = other._mark;
       _table = new uint8_t[_table_size];
       std::memcpy(_table, other._table, _table_size);
+      _dirty = other._dirty;
     }
     return *this;
   }
@@ -81,6 +96,7 @@ class VisitedSet {
     _table_size = other._table_size;
     _mark = other._mark;
     _table = other._table;
+    _dirty = std::move(other._dirty);
     other._table = NULL;
     other._table_size = 0;
     other._mark = 0;
