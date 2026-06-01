@@ -51,6 +51,9 @@ class Index {
 
   struct CompareByFirst {
     constexpr bool operator()(dist_node_t const& a, dist_node_t const& b) const noexcept{
+      if (a.first == b.first) {
+        return a.second > b.second;
+      }
       return a.first < b.first;
     }
   };
@@ -814,7 +817,10 @@ class Index {
         _distance_computations.fetch_add(1);
       }
 
-      if (neighbors.size() < buffer_size || dist < max_dist) {
+      const auto &worst_neighbor = neighbors.top();
+      if (neighbors.size() < buffer_size ||
+          dist < worst_neighbor.first ||
+          (dist == worst_neighbor.first && neighbor_node_id > worst_neighbor.second)) {
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
         // query_visited_nodes_flags.push_back(_hub_nodes[neighbor_node_id]);
