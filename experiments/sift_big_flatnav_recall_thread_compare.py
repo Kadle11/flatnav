@@ -144,6 +144,54 @@ def build_flatnav_index_from_hnsw_graph(
     return index, time.time() - build_start
 
 
+def _compare_traces(
+    serial_trace: List[Dict[str, object]],
+    threaded_trace: List[Dict[str, object]],
+) -> Dict[str, object]:
+    serial_entry = next((s for s in serial_trace if s.get("is_entry")), None)
+    threaded_entry = next((s for s in threaded_trace if s.get("is_entry")), None)
+    serial_entry_node = int(serial_entry["node_id"]) if serial_entry else None
+    threaded_entry_node = int(threaded_entry["node_id"]) if threaded_entry else None
+
+    serial_seq = [s["node_id"] for s in serial_trace]
+    threaded_seq = [s["node_id"] for s in threaded_trace]
+
+    first_divergence: int | None = None
+    for i, (sn, tn) in enumerate(zip(serial_seq, threaded_seq)):
+        if sn != tn:
+            first_divergence = i
+            break
+    if first_divergence is None and len(serial_seq) != len(threaded_seq):
+        first_divergence = min(len(serial_seq), len(threaded_seq))
+
+    serial_ties = sum(1 for s in serial_trace if s.get("is_tie") and not s.get("is_entry"))
+    threaded_ties = sum(1 for s in threaded_trace if s.get("is_tie") and not s.get("is_entry"))
+    serial_tie_wins = sum(1 for s in serial_trace if s.get("tie_break_win"))
+    threaded_tie_wins = sum(1 for s in threaded_trace if s.get("tie_break_win"))
+
+    serial_visited = set(serial_seq)
+    threaded_visited = set(threaded_seq)
+
+    return {
+        "entry_nodes_match": serial_entry_node == threaded_entry_node,
+        "serial_entry_node": serial_entry_node,
+        "threaded_entry_node": threaded_entry_node,
+        "path_length_serial": len(serial_trace),
+        "path_length_threaded": len(threaded_trace),
+        "path_identical": first_divergence is None,
+        "first_divergence_step": first_divergence,
+        "serial_accepted_count": sum(1 for s in serial_trace if s.get("accepted")),
+        "threaded_accepted_count": sum(1 for s in threaded_trace if s.get("accepted")),
+        "serial_tie_count": serial_ties,
+        "threaded_tie_count": threaded_ties,
+        "serial_tie_break_win_count": serial_tie_wins,
+        "threaded_tie_break_win_count": threaded_tie_wins,
+        "visited_nodes_serial_only_count": len(serial_visited - threaded_visited),
+        "visited_nodes_threaded_only_count": len(threaded_visited - serial_visited),
+        "visited_nodes_overlap_count": len(serial_visited & threaded_visited),
+    }
+
+
 def _compare_query_results(
     serial_query_results: List[Dict[str, object]],
     threaded_query_results: List[Dict[str, object]],
@@ -219,33 +267,40 @@ def _compare_query_results(
             for rank in range(compare_k)
         ]
 
-        comparisons.append(
-            {
-                "query_index": query_index,
-                "status": "ok",
-                "label_differences": label_differences,
-                "distance_differences": distance_differences,
-                "label_set_overlap_count": int(len(label_set_intersection)),
-                "label_set_overlap_fraction": float(len(label_set_intersection) / float(max(1, k))),
-                "label_set_overlap_positive": label_set_overlap_positive,
-                "label_set_overlap_negative": label_set_overlap_negative,
-                "label_set_overlap_positive_count": label_set_overlap_positive_count,
-                "label_set_overlap_positive_fraction": label_set_overlap_positive_fraction,
-                "label_set_only_serial": label_set_only_serial,
-                "label_set_only_serial_positive": label_set_only_serial_positive,
-                "label_set_only_serial_negative": label_set_only_serial_negative,
-                "label_set_only_threaded": label_set_only_threaded,
-                "label_set_only_threaded_positive": label_set_only_threaded_positive,
-                "label_set_only_threaded_negative": label_set_only_threaded_negative,
-                "label_mismatch_count": int(sum(not item["same"] for item in label_differences)),
-                "distance_max_abs_diff": float(
-                    max(
-                        (abs(item["difference"]) for item in distance_differences),
-                        default=0.0,
-                    )
-                ),
-            }
-        )
+        entry: Dict[str, object] = {
+            "query_index": query_index,
+            "status": "ok",
+            "label_differences": label_differences,
+            "distance_differences": distance_differences,
+            "label_set_overlap_count": int(len(label_set_intersection)),
+            "label_set_overlap_fraction": float(len(label_set_intersection) / float(max(1, k))),
+            "label_set_overlap_positive": label_set_overlap_positive,
+            "label_set_overlap_negative": label_set_overlap_negative,
+            "label_set_overlap_positive_count": label_set_overlap_positive_count,
+            "label_set_overlap_positive_fraction": label_set_overlap_positive_fraction,
+            "label_set_only_serial": label_set_only_serial,
+            "label_set_only_serial_positive": label_set_only_serial_positive,
+            "label_set_only_serial_negative": label_set_only_serial_negative,
+            "label_set_only_threaded": label_set_only_threaded,
+            "label_set_only_threaded_positive": label_set_only_threaded_positive,
+            "label_set_only_threaded_negative": label_set_only_threaded_negative,
+            "label_mismatch_count": int(sum(not item["same"] for item in label_differences)),
+            "distance_max_abs_diff": float(
+                max(
+                    (abs(item["difference"]) for item in distance_differences),
+                    default=0.0,
+                )
+            ),
+        }
+
+        serial_trace = serial_entry.get("trace")
+        threaded_trace = threaded_entry.get("trace")
+        if serial_trace is not None and threaded_trace is not None:
+            entry["trace_comparison"] = _compare_traces(serial_trace, threaded_trace)
+            entry["serial_trace"] = serial_trace
+            entry["threaded_trace"] = threaded_trace
+
+        comparisons.append(entry)
 
     return comparisons
 
@@ -261,6 +316,11 @@ def _run_search_mode(
 ) -> Dict[str, object]:
     index.set_num_threads(max(1, num_threads))
     logging.info("Set FlatNav search threads to %d for %s run", num_threads, mode_name)
+
+    has_logging = hasattr(index, "enable_search_path_logging")
+    num_queries = len(queries)
+    if has_logging:
+        index.enable_search_path_logging(num_queries)
 
     query_results: List[Dict[str, object]] = []
     recalls: List[float] = []
@@ -311,7 +371,7 @@ def _run_search_mode(
     else:
         try:
             query_start = time.perf_counter()
-            labels, distances = index.search(
+            distances, labels = index.search(
                 queries=queries,
                 K=k,
                 ef_search=ef_search,
@@ -353,6 +413,14 @@ def _run_search_mode(
                         "distances": distance_array[:k].astype(float).tolist(),
                     }
                 )
+
+    # Attach per-query traces (slot i == query i for both serial and parallel paths).
+    if has_logging:
+        traces = index.get_search_path_logs()
+        for qr in query_results:
+            qi = qr.get("query_index")
+            if qi is not None and qi < len(traces):
+                qr["trace"] = traces[qi]
 
     total_sec = time.perf_counter() - start
     avg_recall = float(np.mean(recalls)) if recalls else 0.0

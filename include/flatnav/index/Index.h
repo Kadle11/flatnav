@@ -35,6 +35,20 @@ using flatnav::util::DataType;
 
 namespace flatnav {
 
+// One entry per node encountered during a single beamSearch call.
+struct SearchStepLog {
+  uint32_t node_id;
+  float dist;           // distance from this node to the query
+  float worst_dist;     // worst distance in neighbors heap when this node was evaluated
+  bool accepted;        // node was added to the neighbors heap
+  bool is_entry;        // node is the search entry point (added unconditionally)
+  bool is_tie;          // dist == worst_dist when heap was full (tie situation)
+  bool tie_break_win;   // accepted solely due to the tie-break rule (node_id > worst node_id)
+  // When accepted=true and the heap was already full, the node that was popped
+  // to make room. UINT32_MAX means no pop happened (heap was not yet full).
+  uint32_t popped_node_id;
+};
+
 
 // dist_t: A distance function implementing DistanceInterface.
 // label_t: A fixed-width data type for the label (meta-data) of each point.
@@ -108,6 +122,12 @@ class Index {
   bool _use_random_initialization = false;
   std::mt19937 _generator;
   std::uniform_int_distribution<> _distribution;
+
+  // Search-path logging (lock-free: each query claims one slot via atomic counter;
+  // writing to distinct inner vectors from different threads is safe without locks).
+  bool _log_search_paths = false;
+  mutable std::atomic<uint32_t> _log_query_counter{0};
+  mutable std::vector<std::vector<SearchStepLog>> _search_path_logs;
 
 
   Index(const Index &) = delete;
@@ -489,7 +509,23 @@ class Index {
    * @param num_initializations The number of random initializations to use.
    */
   std::vector<dist_label_t> search(const void* query, const int K, int ef_search,
-                                   int num_initializations = 100) {
+                                   int num_initializations = 100,
+                                   uint32_t query_batch_index = UINT32_MAX) {
+    // Claim a logging slot lock-free; UINT32_MAX signals "no logging".
+    // When query_batch_index is provided (threaded batch search), use it directly
+    // so slot i always maps to query i regardless of thread scheduling order.
+    uint32_t log_slot = UINT32_MAX;
+    if (_log_search_paths) {
+      if (query_batch_index != UINT32_MAX && query_batch_index < _search_path_logs.size()) {
+        log_slot = query_batch_index;
+      } else {
+        uint32_t slot = _log_query_counter.fetch_add(1, std::memory_order_relaxed);
+        if (slot < _search_path_logs.size()) {
+          log_slot = slot;
+        }
+      }
+    }
+
     node_id_t entry_node;
     if (_use_random_initialization) {
       entry_node = randomlyInitializeSearch(query, num_initializations);
@@ -499,7 +535,8 @@ class Index {
     PriorityQueue neighbors =
         beamSearch<true>(/* query = */ query,
                          /* entry_node = */ entry_node,
-                         /* buffer_size = */ std::max(K, ef_search));
+                         /* buffer_size = */ std::max(K, ef_search),
+                         /* log_slot = */ log_slot);
     auto size = neighbors.size();
     std::vector<dist_label_t> results;
     results.reserve(size);
@@ -510,7 +547,7 @@ class Index {
       neighbors.pop();
     }
     std::sort(results.begin(), results.end(),
-              [](const dist_label_t& left, const dist_label_t& right) { return left.first < right.first; });
+              CompareByFirst());  // Sort in ascending order of distance
     if (results.size() > static_cast<size_t>(K)) {
       results.resize(K);
     }
@@ -663,6 +700,31 @@ class Index {
     _distance->getSummary();
   }
 
+  // Pre-allocate `max_queries` log slots and start recording.
+  // Call this before running search queries. Not thread-safe with concurrent search.
+  void enableSearchPathLogging(uint32_t max_queries) {
+    _log_query_counter.store(0, std::memory_order_relaxed);
+    _search_path_logs.assign(max_queries, std::vector<SearchStepLog>());
+    _log_search_paths = true;
+  }
+
+  void disableSearchPathLogging() { _log_search_paths = false; }
+
+  // Clear all logged steps and reset the slot counter, keeping capacity.
+  void resetSearchPathLogs() {
+    _log_query_counter.store(0, std::memory_order_relaxed);
+    for (auto& slot : _search_path_logs) {
+      slot.clear();
+    }
+  }
+
+  const std::vector<std::vector<SearchStepLog>>& getSearchPathLogs() const {
+    return _search_path_logs;
+  }
+
+  // Public label accessor for root-cause analysis.
+  label_t* getNodeLabelPublic(node_id_t n) const { return getNodeLabel(n); }
+
  private:
   friend class cereal::access;
   // Default constructor for cereal
@@ -720,7 +782,8 @@ class Index {
    */
   template <bool is_search_stage = false>
   PriorityQueue beamSearch(const void *query, const node_id_t entry_node,
-                           const int buffer_size) {
+                           const int buffer_size,
+                           const uint32_t log_slot = UINT32_MAX) {
     PriorityQueue neighbors;
     PriorityQueue candidates;
 
@@ -742,8 +805,14 @@ class Index {
     float max_dist = dist;
     candidates.emplace(-dist, entry_node);
     neighbors.emplace(dist, entry_node);
-    query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);  
+    query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);
     visited_set->insert(entry_node);
+
+    if (log_slot != UINT32_MAX) {
+      _search_path_logs[log_slot].push_back(
+          {entry_node, dist, dist, /*accepted=*/true, /*is_entry=*/true,
+           /*is_tie=*/false, /*tie_break_win=*/false, /*popped_node_id=*/UINT32_MAX});
+    }
 
     while (!candidates.empty()) {
       auto [distance, node] = candidates.top();
@@ -771,8 +840,9 @@ class Index {
           /* max_dist = */ max_dist, /* buffer_size = */ buffer_size,
           /* visited_set = */ visited_set,
           /* neighbors = */ neighbors, /* candidates = */ candidates,
-          /* query_visited_nodes = */ query_visited_nodes_flags);
-      
+          /* query_visited_nodes = */ query_visited_nodes_flags,
+          /* log_slot = */ log_slot);
+
     }
 
     _visited_set_pool->pushVisitedSet(
@@ -785,12 +855,14 @@ class Index {
   void processCandidateNode(const void *query, node_id_t &node, float &max_dist,
                             const int buffer_size, VisitedSet *visited_set,
                             PriorityQueue &neighbors,
-                            PriorityQueue &candidates, std::vector<bool>& query_visited_nodes_flags) {
+                            PriorityQueue &candidates,
+                            std::vector<bool>& query_visited_nodes_flags,
+                            const uint32_t log_slot = UINT32_MAX) {
     // Lock all operations on this specific node
     std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
 
     node_id_t *neighbor_node_links = getNodeLinks(node);
-    query_visited_nodes_flags.push_back(_hub_nodes[node]);  
+    query_visited_nodes_flags.push_back(_hub_nodes[node]);
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
 
@@ -817,23 +889,42 @@ class Index {
         _distance_computations.fetch_add(1);
       }
 
+      // Capture the worst neighbor state before any heap mutation so we can
+      // log it and compute the acceptance decision atomically.
       const auto &worst_neighbor = neighbors.top();
-      if (neighbors.size() < buffer_size ||
-          dist < worst_neighbor.first ||
-          (dist == worst_neighbor.first && neighbor_node_id > worst_neighbor.second)) {
+      float worst_dist = worst_neighbor.first;
+      node_id_t worst_id = worst_neighbor.second;
+      bool heap_full = (neighbors.size() >= static_cast<size_t>(buffer_size));
+      bool is_tie = heap_full && (dist == worst_dist);
+      bool tie_break_win = is_tie && (neighbor_node_id > worst_id);
+      bool accepted = !heap_full || (dist < worst_dist) || tie_break_win;
+
+      if (accepted) {
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
-        // query_visited_nodes_flags.push_back(_hub_nodes[neighbor_node_id]);
 #ifdef USE_SSE
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
 #endif
-        if (neighbors.size() > buffer_size) {
+        uint32_t popped = UINT32_MAX;
+        if (neighbors.size() > static_cast<size_t>(buffer_size)) {
+          popped = neighbors.top().second;
           neighbors.pop();
         }
         if (!neighbors.empty()) {
           max_dist = neighbors.top().first;
         }
+
+        if (log_slot != UINT32_MAX) {
+          _search_path_logs[log_slot].push_back(
+              {neighbor_node_id, dist, worst_dist, /*accepted=*/true,
+               /*is_entry=*/false, is_tie, tie_break_win, popped});
+        }
+      } else if (log_slot != UINT32_MAX) {
+        _search_path_logs[log_slot].push_back(
+            {neighbor_node_id, dist, worst_dist, /*accepted=*/false,
+             /*is_entry=*/false, is_tie, tie_break_win, /*popped=*/UINT32_MAX});
       }
+
     }
   }
 

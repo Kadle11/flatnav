@@ -33,3 +33,5 @@ external/openmp
 wheelhouse
 
 hnswlib-original/
+
+CLAUDE.md

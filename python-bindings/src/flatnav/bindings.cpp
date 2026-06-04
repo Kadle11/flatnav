@@ -206,7 +206,8 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
             auto* query = (const void*)queries.data(row_index);
             std::vector<std::pair<float, label_t>> top_k = this->_index->search(
                 /* query = */ query, /* K = */ K, /* ef_search = */ ef_search,
-                /* num_initializations = */ num_initializations);
+                /* num_initializations = */ num_initializations,
+                /* query_batch_index = */ row_index);
 
             for (uint32_t result_id = 0; result_id < K; result_id++) {
               distances[(row_index * K) + result_id] = top_k[result_id].first;
@@ -228,7 +229,11 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::array_t<float> dists = py::array_t<float>(
         {num_queries, (size_t)K}, {K * sizeof(float), sizeof(float)}, distances, free_distances_when_done);
 
-    return {labels, dists};
+    // DistancesLabelsPair = pair<py::array_t<float>, py::array_t<label_t>>.
+    // Distances go in the float position, labels in the label_t position.
+    // Returning {labels, dists} here would silently cast int32 labels to float32
+    // (via pybind11's pair conversion), losing precision for odd node IDs > 2^24.
+    return {dists, labels};
   }
 
  public:
@@ -313,6 +318,44 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
   void setNumThreads(uint32_t num_threads) { _index->setNumThreads(num_threads); }
 
   uint32_t getNumThreads() { return _index->getNumThreads(); }
+
+  // Direct label read for root-cause analysis: returns the label stored at node_id.
+  label_t getStoredNodeLabel(uint32_t node_id) const {
+    return *(_index->getNodeLabelPublic(node_id));
+  }
+
+  void enableSearchPathLogging(uint32_t max_queries) {
+    _index->enableSearchPathLogging(max_queries);
+  }
+
+  void disableSearchPathLogging() { _index->disableSearchPathLogging(); }
+
+  void resetSearchPathLogs() { _index->resetSearchPathLogs(); }
+
+  // Returns a list (one entry per query slot) of lists (one entry per visited
+  // node) of dicts with keys: node_id, dist, worst_dist, accepted, is_entry,
+  // is_tie, tie_break_win.
+  py::list getSearchPathLogs() const {
+    const auto& logs = _index->getSearchPathLogs();
+    py::list outer;
+    for (const auto& slot : logs) {
+      py::list inner;
+      for (const auto& step : slot) {
+        py::dict d;
+        d["node_id"] = step.node_id;
+        d["dist"] = step.dist;
+        d["worst_dist"] = step.worst_dist;
+        d["accepted"] = step.accepted;
+        d["is_entry"] = step.is_entry;
+        d["is_tie"] = step.is_tie;
+        d["tie_break_win"] = step.tie_break_win;
+        d["popped_node_id"] = step.popped_node_id;  // UINT32_MAX means no pop
+        inner.append(d);
+      }
+      outer.append(inner);
+    }
+    return outer;
+  }
 
   void save(const std::string& filename) { _index->saveIndex(/* filename = */ filename); }
 
@@ -489,6 +532,18 @@ void bindSpecialization(py::module_& index_submodule) {
            SET_NUM_THREADS_DOCSTRING)
       .def("set_hub_nodes", &IndexType::setHubNodes, py::arg("hub_nodes"))
       .def("get_visited_nodes_sequence", &IndexType::getVisitedNodesSequence)
+      .def("enable_search_path_logging", &IndexType::enableSearchPathLogging,
+           py::arg("max_queries"),
+           "Pre-allocate log slots for up to max_queries search calls and start recording.")
+      .def("disable_search_path_logging", &IndexType::disableSearchPathLogging,
+           "Stop recording search path logs.")
+      .def("reset_search_path_logs", &IndexType::resetSearchPathLogs,
+           "Clear all recorded steps and reset the slot counter.")
+      .def("get_search_path_logs", &IndexType::getSearchPathLogs,
+           "Return recorded search paths as list[list[dict]]. "
+           "Each dict has: node_id, dist, worst_dist, accepted, is_entry, is_tie, tie_break_win.")
+      .def("get_stored_node_label", &IndexType::getStoredNodeLabel, py::arg("node_id"),
+           "Return the label stored at node_id in _index_memory (for root-cause analysis).")
       .def_static("load_index", &IndexType::loadIndex, py::arg("filename"),
                   LOAD_INDEX_DOCSTRING)
       .def_property_readonly("max_edges_per_node",
