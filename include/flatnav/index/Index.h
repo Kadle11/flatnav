@@ -1,6 +1,7 @@
 #pragma once
 
 #include <flatnav/distances/DistanceInterface.h>
+#include <flatnav/index/QueryState.h>
 #include <flatnav/util/Macros.h>
 #include <flatnav/util/Multithreading.h>
 #include <flatnav/util/Reordering.h>
@@ -39,6 +40,7 @@ class Index {
   // internal node numbering scheme. We might need to change this to uint64_t
   typedef uint32_t node_id_t;
   typedef std::pair<float, node_id_t> dist_node_t;
+  using Qstate = QueryState<dist_node_t, node_id_t>;
 
   // NOTE: by default this is a max-heap. We could make this a min-heap
   // by using std::greater, but we want to use the queue as both a max-heap and
@@ -68,6 +70,7 @@ class Index {
   std::mutex _index_data_guard;
 
   uint32_t _num_threads;
+  uint32_t _search_concurrency = 4;
 
   // Remembers which nodes we've visited, to avoid re-computing distances.
   VisitedSetPool* _visited_set_pool;
@@ -358,7 +361,7 @@ class Index {
           "create a larger index.");
     }
     std::unique_lock<std::mutex> global_lock(_index_data_guard);
-    auto entry_node = initializeSearch(data, num_initializations);
+    auto [entry_node, _init_dist] = initializeSearch(data, num_initializations);
     node_id_t new_node_id;
     allocateNode(data, label, new_node_id);
     global_lock.unlock();
@@ -385,7 +388,7 @@ class Index {
    */
   std::vector<dist_label_t> search(const void* query, const int K, int ef_search,
                                    int num_initializations = 100) {
-    node_id_t entry_node = initializeSearch(query, num_initializations);
+    auto [entry_node, _init_dist] = initializeSearch(query, num_initializations);
     PriorityQueue neighbors = beamSearch(/* query = */ query,
                                          /* entry_node = */ entry_node,
                                          /* buffer_size = */ std::max(ef_search, K));
@@ -406,6 +409,275 @@ class Index {
     return results;
   }
 
+  std::vector<std::vector<dist_label_t>> concurrentBatchSearch(const void * queries,
+      size_t num_queries, int K, int ef_search,
+      int num_initializations = 100,
+      uint32_t concurrency = 4) {
+
+    if (concurrency == 0) {
+      throw std::invalid_argument("concurrency must be greater than 0.");
+    }
+
+    std::vector<std::vector<dist_label_t>> all_results(num_queries);
+    const size_t buffer_size = static_cast<size_t>(std::max(ef_search, K));
+    const size_t actual_concurrency = std::min(concurrency, static_cast<uint32_t>(num_queries));
+    std::vector<Qstate> states(actual_concurrency);
+
+    // We need to track the idx of the query each slot is working on
+    std::vector<size_t> slot_query_idx(actual_concurrency);
+    size_t next_query = actual_concurrency;
+
+    for(size_t q = 0; q < actual_concurrency; q++) {
+      slot_query_idx[q] = q;
+      states[q].query = static_cast<const char*>(queries) + q * _data_size_bytes;
+    }
+
+    auto init_results = interleavedInitializeSearch(states, num_initializations);
+
+    for (size_t q = 0; q < actual_concurrency; q++) {
+      seedBeamSearchState(states[q], init_results[q], buffer_size);
+    }
+
+    size_t active_count = actual_concurrency;
+
+    while(active_count > 0){
+      for (size_t q = 0; q < actual_concurrency; q++){
+        auto &s = states[q];
+        if(s.execution_state == QueryExecutionState::Done) continue;
+
+        switch (s.execution_state){
+          case QueryExecutionState::Unscheduled:
+            popCandidateOrFinish(
+              s, K, buffer_size, num_initializations, queries,
+              num_queries, next_query, slot_query_idx[q],
+              all_results, active_count);
+            break;
+          case QueryExecutionState::ProcessingLinks:
+            processOneLink(s, buffer_size);
+            break;
+          case QueryExecutionState::Done:
+            break;
+        }
+      }
+    }
+    return all_results;
+  }
+
+  std::vector<std::pair<node_id_t, float>> interleavedInitializeSearch(
+      const std::vector<Qstate> &states, int num_initializations) {
+
+    if (num_initializations <= 0) {
+      throw std::invalid_argument("num_initializations must be greater than 0.");
+    }
+    
+    int step_size = _cur_num_nodes / num_initializations;
+    step_size = std::max(step_size, 1);
+
+    const size_t num_queries = states.size();
+    struct InitState {
+      node_id_t current_node = 0;
+      node_id_t best_node = 0;
+      float min_dist = std::numeric_limits<float>::max();
+      bool done = false;
+    };
+
+    std::vector<InitState> init_states(num_queries);
+
+    if(_collect_stats) {
+      _distance_computations.fetch_add(
+        static_cast<uint64_t>(num_initializations) * num_queries
+      );
+    }
+
+    size_t queries_remaning = num_queries;
+    while(queries_remaning > 0) {
+      for(size_t q = 0; q < num_queries; q++) {
+        auto &is = init_states[q];
+        if(is.done) continue;
+
+        float dist = _distance->distance(states[q].query,
+          getNodeData(is.current_node), true);
+
+        if (dist < is.min_dist) {
+          is.min_dist = dist;
+          is.best_node = is.current_node;
+        }
+
+        is.current_node += step_size;
+
+        if (is.current_node >= _cur_num_nodes) {
+          is.done = true;
+          queries_remaning--;
+        } else {
+#ifdef USE_SSE
+          _mm_prefetch(getNodeData(is.current_node), _MM_HINT_T0);
+#endif
+        }
+      }
+    }
+
+    std::vector<std::pair<node_id_t, float>> results(num_queries);
+    for(size_t q = 0; q < num_queries; q++) {
+      results[q] = {init_states[q].best_node, init_states[q].min_dist};
+    }
+
+    return results;
+  }
+
+  void seedBeamSearchState(Qstate& s, const std::pair<node_id_t, float>& entry, size_t buffer_size) {
+    auto [entry_node, entry_dist] = entry;
+
+    s.visited.clear();
+    s.visited.reserve(2 * buffer_size); // heuristic to reduce rehashing
+    s.visited.insert(entry_node);
+
+    s.max_dist = entry_dist;
+
+    s.candidates.clear();
+    s.candidates.emplace_back(-entry_dist, entry_node);
+    std::push_heap(s.candidates.begin(), s.candidates.end(), cmp);
+
+    s.neighbors.clear();
+    s.neighbors.reserve(buffer_size);
+    s.neighbors.emplace_back(entry_dist, entry_node);
+    std::push_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
+
+
+    s.current_links = nullptr;
+    s.link_idx = 0;
+    s.execution_state = QueryExecutionState::Unscheduled;
+  }
+
+  void finishQuery(Qstate& s, int K, std::vector<dist_label_t>& results) {
+    s.execution_state = QueryExecutionState::Done;
+    while (s.neighbors.size() > static_cast<size_t>(K)) {
+      std::pop_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
+      s.neighbors.pop_back();
+    }
+
+    size_t result_size = s.neighbors.size();
+    results.resize(result_size);
+
+    for (size_t i = result_size; i-- > 0;) {
+      auto [dist, node_id] = s.neighbors.front();
+      std::pop_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
+      s.neighbors.pop_back();
+      results[i] = {dist, *(getNodeLabel(node_id))};
+    }
+  }
+
+  inline void setSearchConcurrency(uint32_t concurrency) {
+    if (concurrency == 0) {
+      throw std::invalid_argument(
+        "Search concurrency must be greater than 0");
+    }
+    _search_concurrency = concurrency;
+  }
+
+  bool popCandidateOrFinish(Qstate& s, int K, size_t buffer_size,
+                            int num_initializations, const void* queries,
+                            size_t num_queries, size_t& next_query,
+                            size_t& slot_query_idx,
+                            std::vector<std::vector<dist_label_t>>& all_results,
+                            size_t& active_count) {
+    
+    // No candidates left to explore, search is done here
+    if(s.candidates.empty()) {
+      return replaceSlot(s, K, buffer_size, num_initializations, queries,
+        num_queries, next_query, slot_query_idx, all_results, active_count);
+    }
+
+    auto [neg_dist, node_id] = s.candidates.front();
+    std::pop_heap(s.candidates.begin(), s.candidates.end(), cmp);
+    s.candidates.pop_back();
+
+
+    // We ain't finding anything better, finish the search for this query
+    if (-neg_dist > s.max_dist && s.neighbors.size() >= buffer_size) {
+      return replaceSlot(s, K, buffer_size, num_initializations, queries,
+        num_queries, next_query, slot_query_idx, all_results, active_count);
+    }
+
+    s.current_links = getNodeLinks(node_id);
+    s.execution_state = QueryExecutionState::ProcessingLinks;
+    s.link_idx = 0;
+
+#ifdef USE_SSE
+    _mm_prefetch(getNodeData(s.current_links[0]), _MM_HINT_T0);
+#endif
+
+    return false;
+  }
+
+  bool replaceSlot(Qstate& s, int K, size_t buffer_size,
+                   int num_initializations, const void* queries,
+                   size_t num_queries, size_t& next_query,
+                   size_t& slot_query_idx,
+                   std::vector<std::vector<dist_label_t>>& all_results,
+                   size_t& active_count) {
+    finishQuery(s, K, all_results[slot_query_idx]);
+
+    if (next_query >= num_queries) {
+      active_count--;
+      return false;
+    }
+
+    slot_query_idx = next_query;
+    next_query++;
+
+    s.query = static_cast<const char*>(queries) + slot_query_idx * _data_size_bytes;
+    auto init_result = initializeSearch(s.query, num_initializations);
+    seedBeamSearchState(s, init_result, buffer_size);
+    return true;
+  }
+
+  void processOneLink(Qstate& s, size_t buffer_size) {
+
+    while (s.link_idx < _M) {
+      node_id_t neighbor_id = s.current_links[s.link_idx];
+      s.link_idx++;
+
+#ifdef USE_SSE
+    if (s.link_idx < _M) {
+      _mm_prefetch(getNodeData(s.current_links[s.link_idx]), _MM_HINT_T0);
+    }
+#endif
+
+      if(s.visited.count(neighbor_id) > 0) continue;
+      s.visited.insert(neighbor_id);
+
+      float dist = _distance->distance(s.query, getNodeData(neighbor_id), true);
+      if (_collect_stats) {
+        _distance_computations.fetch_add(1);
+      }
+
+      if (s.neighbors.size() < buffer_size || dist < s.max_dist) {
+        s.candidates.emplace_back(-dist, neighbor_id);
+        std::push_heap(s.candidates.begin(), s.candidates.end(), cmp);
+
+        s.neighbors.emplace_back(dist, neighbor_id);
+        std::push_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
+
+        if (s.neighbors.size() > buffer_size) {
+          std::pop_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
+          s.neighbors.pop_back();
+        }
+        if (!s.neighbors.empty()) {
+          s.max_dist = s.neighbors.front().first;
+        }
+      }
+
+      break; // yield
+    }
+
+    if (s.link_idx >= _M) {
+      s.execution_state = QueryExecutionState::Unscheduled;
+    }
+  }
+
+  inline uint32_t getSearchConcurrency() const {
+    return _search_concurrency;
+  }
 
   void doGraphReordering(const std::vector<std::string>& reordering_methods) {
 
@@ -845,7 +1117,7 @@ class Index {
    * @param num_initializations
    * @return node_id_t
    */
-  inline node_id_t initializeSearch(const void* query, int num_initializations) {
+  inline std::pair<node_id_t, float> initializeSearch(const void* query, int num_initializations) {
     // select entry_node from a set of random entry point options
     if (num_initializations <= 0) {
       throw std::invalid_argument("num_initializations must be greater than 0.");
@@ -862,6 +1134,12 @@ class Index {
     }
 
     for (node_id_t node = 0; node < _cur_num_nodes; node += step_size) {
+#ifdef USE_SSE
+      node_id_t next_node = node + step_size;
+      if (next_node < _cur_num_nodes) {
+        _mm_prefetch(getNodeData(next_node), _MM_HINT_T0);
+      }
+#endif
       float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(node),
                                        /* asymmetric = */ true);
       if (dist < min_dist) {
@@ -869,7 +1147,7 @@ class Index {
         entry_node = node;
       }
     }
-    return entry_node;
+    return {entry_node, min_dist};
   }
 
   void relabel(const std::vector<node_id_t>& P) {
