@@ -6,6 +6,7 @@
 #include <flatnav/util/Reordering.h>
 #include <flatnav/util/VisitedSetPool.h>
 #include <flatnav/util/Datatype.h>
+#include <flatnav/util/PhaseProfiler.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -526,6 +527,13 @@ class Index {
 
   inline uint64_t distanceComputations() const { return _distance_computations.load(); }
 
+  // Per-phase timing (no-ops unless built with -DFLATNAV_PROFILE_PHASES).
+  // Profile single-threaded: reset, run one query stream on this thread, dump.
+  inline void resetPhaseProfile() const { flatnav::profiling::reset(); }
+  inline void dumpPhaseProfile(const char* tag = "") const {
+    flatnav::profiling::dump(tag);
+  }
+
   inline DataType getDataType() const { return _data_type; }
 
   void resetStats() {
@@ -623,12 +631,15 @@ class Index {
     visited_set->insert(entry_node);
 
     while (!candidates.empty()) {
+      FN_PHASE_BEGIN(Select);
       auto [distance, node] = candidates.top();
 
       if (-distance > max_dist && neighbors.size() >= buffer_size) {
+        FN_PHASE_END(Select);
         break;
       }
       candidates.pop();
+      FN_PHASE_END(Select);
 
       // Prefetching the next candidate node data and visited set marker
       // before processing it. Note that this might not be useful if the current
@@ -658,6 +669,7 @@ class Index {
 
   void processCandidateNode(const void* query, node_id_t& node, float& max_dist, const int buffer_size,
                             VisitedSet* visited_set, PriorityQueue& neighbors, PriorityQueue& candidates) {
+    FN_PHASE_BEGIN(Node);
     // Lock all operations on this specific node
     std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
 
@@ -680,15 +692,18 @@ class Index {
         continue;
       }
       visited_set->insert(/* num = */ neighbor_node_id);
+      FN_PHASE_BEGIN(Dist);
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(neighbor_node_id),
                                  /* asymmetric = */ true);
+      FN_PHASE_END(Dist);
 
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
       }
 
       if (neighbors.size() < buffer_size || dist < max_dist) {
+        FN_PHASE_BEGIN(CI);
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
 #ifdef USE_SSE
@@ -700,8 +715,10 @@ class Index {
         if (!neighbors.empty()) {
           max_dist = neighbors.top().first;
         }
+        FN_PHASE_END(CI);
       }
     }
+    FN_PHASE_END(Node);
   }
 
   /**
