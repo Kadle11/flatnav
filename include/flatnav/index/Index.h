@@ -7,6 +7,8 @@
 #include <flatnav/util/Reordering.h>
 #include <flatnav/util/VisitedSetPool.h>
 #include <flatnav/util/Datatype.h>
+#include <flatnav/util/PhaseProfiler.h>
+#include <flatnav/util/AccessTracer.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -430,6 +432,7 @@ class Index {
     for(size_t q = 0; q < actual_concurrency; q++) {
       slot_query_idx[q] = q;
       states[q].query = static_cast<const char*>(queries) + q * _data_size_bytes;
+      states[q].query_id = static_cast<uint32_t>(q);
     }
 
     auto init_results = interleavedInitializeSearch(states, num_initializations);
@@ -460,6 +463,7 @@ class Index {
         }
       }
     }
+    ::flatnav::tracing::flushDefault();
     return all_results;
   }
 
@@ -545,6 +549,7 @@ class Index {
 
     s.current_links = nullptr;
     s.link_idx = 0;
+    s.hop = 0;
     s.execution_state = QueryExecutionState::Unscheduled;
   }
 
@@ -574,6 +579,12 @@ class Index {
     _search_concurrency = concurrency;
   }
 
+  // Per-phase timing (no-ops unless built with -DFLATNAV_PROFILE_PHASES).
+  inline void resetPhaseProfile() const { ::flatnav::profiling::reset(); }
+  inline void dumpPhaseProfile(const char* tag = "") const {
+    ::flatnav::profiling::dump(tag);
+  }
+
   bool popCandidateOrFinish(Qstate& s, int K, size_t buffer_size,
                             int num_initializations, const void* queries,
                             size_t num_queries, size_t& next_query,
@@ -587,9 +598,11 @@ class Index {
         num_queries, next_query, slot_query_idx, all_results, active_count);
     }
 
+    FN_PHASE_BEGIN(Select);
     auto [neg_dist, node_id] = s.candidates.front();
     std::pop_heap(s.candidates.begin(), s.candidates.end(), cmp);
     s.candidates.pop_back();
+    FN_PHASE_END(Select);
 
 
     // We ain't finding anything better, finish the search for this query
@@ -598,9 +611,12 @@ class Index {
         num_queries, next_query, slot_query_idx, all_results, active_count);
     }
 
+    FN_PHASE_BEGIN(Traverse);
     s.current_links = getNodeLinks(node_id);
+    FN_PHASE_END(Traverse);
     s.execution_state = QueryExecutionState::ProcessingLinks;
     s.link_idx = 0;
+    s.hop++;
 
 #ifdef USE_SSE
     _mm_prefetch(getNodeData(s.current_links[0]), _MM_HINT_T0);
@@ -624,6 +640,7 @@ class Index {
 
     slot_query_idx = next_query;
     next_query++;
+    s.query_id = static_cast<uint32_t>(slot_query_idx);
 
     s.query = static_cast<const char*>(queries) + slot_query_idx * _data_size_bytes;
     auto init_result = initializeSearch(s.query, num_initializations);
@@ -646,12 +663,16 @@ class Index {
       if(s.visited.count(neighbor_id) > 0) continue;
       s.visited.insert(neighbor_id);
 
+      FN_TRACE_ACCESS(s.query_id, neighbor_id, s.hop);
+      FN_PHASE_BEGIN(Dist);
       float dist = _distance->distance(s.query, getNodeData(neighbor_id), true);
+      FN_PHASE_END(Dist);
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
       }
 
       if (s.neighbors.size() < buffer_size || dist < s.max_dist) {
+        FN_PHASE_BEGIN(CI);
         s.candidates.emplace_back(-dist, neighbor_id);
         std::push_heap(s.candidates.begin(), s.candidates.end(), cmp);
 
@@ -665,6 +686,7 @@ class Index {
         if (!s.neighbors.empty()) {
           s.max_dist = s.neighbors.front().first;
         }
+        FN_PHASE_END(CI);
       }
 
       break; // yield

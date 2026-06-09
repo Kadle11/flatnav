@@ -27,6 +27,8 @@ struct QueryState {
     float max_dist;
     node_id_t* current_links;
     uint32_t link_idx;
+    uint32_t query_id = 0;  // index of the query this slot serves (access tracing)
+    uint32_t hop = 0;       // expansion count within this query (access tracing)
 
 
     void resetForQuery(const void* new_query,
@@ -46,6 +48,7 @@ struct QueryState {
       max_dist = std::numeric_limits<float>::max();
       current_links = nullptr;
       link_idx = 0;
+      hop = 0;
     }
 };
 }
