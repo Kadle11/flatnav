@@ -356,6 +356,74 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
         },
         K, ef_search, num_initializations);
   }
+
+  DistancesLabelsPair concurrentBatchSearch(const py::array& queries, int K, int ef_search,
+                                            int num_initializations = 100, uint32_t concurrency = 4) {
+    auto data_type = _index->getDataType();
+    return cast_and_call(
+        data_type, queries,
+        [this](auto&& casted_queries, int k, int ef, int num_init, uint32_t conc) {
+          return this->concurrentBatchSearchImpl(std::forward<decltype(casted_queries)>(casted_queries), k, ef, num_init, conc);
+        },
+        K, ef_search, num_initializations, concurrency);
+  }
+
+  void setSearchConcurrency(uint32_t concurrency) {
+    _index->setSearchConcurrency(concurrency);
+  }
+
+  uint32_t getSearchConcurrency() {
+    return _index->getSearchConcurrency();
+  }
+
+  private:
+  
+    template <typename data_type>
+    DistancesLabelsPair concurrentBatchSearchImpl(
+        const py::array_t<data_type, py::array::c_style | py::array::forcecast>& queries, int K, int ef_search,
+        int num_initializations = 100, uint32_t concurrency = 4) {
+      
+      size_t num_queries = queries.shape(0);
+      size_t queries_dim = queries.shape(1);
+
+      if (queries.ndim() != 2 || queries_dim != _dim) {
+        throw std::invalid_argument("Queries have incorrect dimensions.");
+      }
+
+      label_t* results = new label_t[num_queries * K];
+      float* distances = new float[num_queries * K];
+
+      {
+        // Release python GIL while threads are running
+        py::gil_scoped_release gil;
+        std::vector<std::vector<std::pair<float, label_t>>> all_results = this->_index->concurrentBatchSearch(
+            /* queries = */ (const void*)queries.data(0), /* num_queries = */ num_queries, /* K = */ K,
+            /* ef_search = */ ef_search, /* num_initializations = */ num_initializations,
+            /* concurrency = */ concurrency);
+
+        for (size_t query_index = 0; query_index < num_queries; query_index++) {
+          auto& top_k = all_results[query_index];
+          for (size_t result_id = 0; result_id < static_cast<size_t>(K) && result_id < top_k.size(); result_id++) {
+            distances[(query_index * K) + result_id] = top_k[result_id].first;
+            results[(query_index * K) + result_id] = top_k[result_id].second;
+          }
+        }
+      }
+
+      py::capsule free_results_when_done(results, [](void* ptr) { delete (label_t*)ptr; });
+      py::capsule free_distances_when_done(distances, [](void* ptr) { delete (float*)ptr; });
+
+      py::array_t<label_t> labels = py::array_t<label_t>({num_queries, (size_t)K},  // shape of the array
+                                                         {K * sizeof(label_t), sizeof(label_t)}, results,
+                                                         free_results_when_done);
+
+
+      py::array_t<float> dists = py::array_t<float>(
+          {num_queries, (size_t)K}, {K * sizeof(float), sizeof(float)}, distances, free_distances_when_done);
+      
+      return {dists, labels};
+    }
+
 };
 
 template <typename dist_t>
@@ -474,6 +542,17 @@ void bindSpecialization(py::module_& index_submodule) {
           },
           py::arg("queries"), py::arg("K"), py::arg("ef_search"), py::arg("num_initializations") = 100,
           SEARCH_DOCSTRING)
+      .def(
+          "concurrent_batch_search",
+          [](IndexType& index, const py::array& queries, int K, int ef_search,
+             int num_initializations = 100, uint32_t concurrency = 4) {
+            return index.concurrentBatchSearch(queries, K, ef_search, num_initializations, concurrency);
+          },
+          py::arg("queries"), py::arg("K"), py::arg("ef_search"), py::arg("num_initializations") = 100,
+          py::arg("concurrency") = 4,
+          "Search queries in parallel using concurrent batch search.")
+      .def("set_search_concurrency", &IndexType::setSearchConcurrency, py::arg("concurrency"), "Set the concurrency level for concurrent batch search.")
+      .def_property_readonly("search_concurrency", &IndexType::getSearchConcurrency, "Get the concurrency level for concurrent batch search.")
       .def("get_query_distance_computations", &IndexType::getQueryDistanceComputations,
            GET_QUERY_DISTANCE_COMPUTATIONS_DOCSTRING)
       .def("save", &IndexType::save, py::arg("filename"), SAVE_DOCSTRING)
