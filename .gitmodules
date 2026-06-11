@@ -1,3 +1,6 @@
 [submodule "external/cereal"]
 	path = external/cereal
 	url = https://github.com/USCiLab/cereal.git
+[submodule "hnswlib-original"]
+	path = hnswlib-original
+	url = https://github.com/BlaiseMuhirwa/hnswlib-original.git
