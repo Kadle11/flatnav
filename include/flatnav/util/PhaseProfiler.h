@@ -4,10 +4,11 @@
 //
 // Maps to the CXL-ANNS query-scheduling phases:
 //   Select (S)   -- pop nearest unvisited candidate            (beamSearch)
-//   Traverse (T) -- read adjacency + per-node bookkeeping       (derived: Node - Dist - CI)
-//   Dist         -- distance() call, INCLUDES the neighbor      (processCandidateNode)
-//                   vector fetch (GraphRead) which is fused in
+//   Traverse (T) -- getNodeLinks: read the node's adjacency     (processCandidateNode)
+//   DistComp     -- getNodeData (vector read) + distance()      (processCandidateNode)
 //   CI           -- candidate/neighbor heap insert + trim        (processCandidateNode)
+//   Other        -- remainder of processCandidateNode: visited-set probes, the
+//                   neighbor loop, lock (derived = Node - Traverse - DistComp - CI)
 //
 // Zero cost unless built with -DFLATNAV_PROFILE_PHASES. Counters are
 // thread_local with no locking, so profile SINGLE-THREADED for clean numbers
@@ -29,7 +30,7 @@ namespace profiling {
 
 #if defined(FLATNAV_PROFILE_PHASES)
 
-enum class Phase : int { Select = 0, Traverse, Dist, CI, Node, COUNT };
+enum class Phase : int { Select = 0, Traverse, Dist, CI, Other, Node, COUNT };
 
 struct PhaseAccum {
   uint64_t cycles[static_cast<int>(Phase::COUNT)] = {0};
@@ -60,17 +61,21 @@ inline void reset() { g_phase = PhaseAccum{}; }
 
 inline void dump(const char* tag = "") {
   using P = Phase;
-  // Traverse + per-node overhead = processCandidateNode total - Dist - CI.
+  // Traverse, Dist (DistComp), CI are measured directly; "Other" is the
+  // remainder of processCandidateNode (visited-set probes, loop, lock).
   uint64_t node = g_phase.cycles[static_cast<int>(P::Node)];
-  uint64_t dist = g_phase.cycles[static_cast<int>(P::Dist)];
-  uint64_t ci = g_phase.cycles[static_cast<int>(P::CI)];
-  g_phase.cycles[static_cast<int>(P::Traverse)] =
-      (node > dist + ci) ? (node - dist - ci) : 0;
-  g_phase.count[static_cast<int>(P::Traverse)] =
+  uint64_t known = g_phase.cycles[static_cast<int>(P::Traverse)] +
+                   g_phase.cycles[static_cast<int>(P::Dist)] +
+                   g_phase.cycles[static_cast<int>(P::CI)];
+  g_phase.cycles[static_cast<int>(P::Other)] = (node > known) ? (node - known) : 0;
+  g_phase.count[static_cast<int>(P::Other)] =
       g_phase.count[static_cast<int>(P::Node)];
 
-  const char* names[] = {"Select (S)", "Traverse (T) + node overhead",
-                         "Dist + GraphRead (fused)", "Candidate Insert (CI)",
+  const char* names[] = {"Select (S)",
+                         "Traverse (T) = getNodeLinks",
+                         "DistComp = getNodeData + distance",
+                         "Candidate Insert (CI)",
+                         "Other (visited-set, loop, lock)",
                          "processCandidateNode (total)"};
 #if defined(__x86_64__) || defined(_M_X64)
   const char* unit = "cyc";
@@ -82,7 +87,7 @@ inline void dump(const char* tag = "") {
     uint64_t c = g_phase.cycles[i];
     uint64_t n = g_phase.count[i];
     double avg = n ? static_cast<double>(c) / static_cast<double>(n) : 0.0;
-    std::printf("  %-30s total=%14llu %s  calls=%12llu  avg=%10.1f %s\n",
+    std::printf("  %-34s total=%14llu %s  calls=%12llu  avg=%10.1f %s\n",
                 names[i], static_cast<unsigned long long>(c), unit,
                 static_cast<unsigned long long>(n), avg, unit);
   }

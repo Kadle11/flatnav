@@ -673,7 +673,21 @@ class Index {
     // Lock all operations on this specific node
     std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
 
+#ifdef FLATNAV_PROFILE_PHASES
+    // Traverse = the adjacency-list read. getNodeLinks() only computes a pointer,
+    // so copy the M links into a reused (warm) buffer inside the timed region:
+    // a genuine read of every link, consumed by the loop below (no throwaway
+    // sink), so the link fetch is attributed to Traverse and net memory traffic
+    // is unchanged (the links are read from the node block once).
+    FN_PHASE_BEGIN(Traverse);
+    node_id_t* _src_links = getNodeLinks(node);
+    thread_local std::vector<node_id_t> _links_buf;
+    _links_buf.assign(_src_links, _src_links + _M);
+    node_id_t* neighbor_node_links = _links_buf.data();
+    FN_PHASE_END(Traverse);
+#else
     node_id_t* neighbor_node_links = getNodeLinks(node);
+#endif
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
 
