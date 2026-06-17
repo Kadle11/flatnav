@@ -22,6 +22,13 @@ enum class MetricType { L2, IP };
 template <typename T>
 class DistanceInterface {
  public:
+  // A virtual destructor is required because instances are owned and deleted
+  // through a base-class pointer (e.g. Index holds a
+  // std::unique_ptr<DistanceInterface<T>>). Distance computations still
+  // dispatch statically via CRTP (static_cast below), so the hot path is
+  // unaffected; the vtable is only used for correct destruction.
+  virtual ~DistanceInterface() = default;
+
   // The asymmetric flag is used to indicate whether the distance function
   // is between two database vectors (symmetric) or between a database vector
   // and a query vector. For regular distances (l2, inner product), there is

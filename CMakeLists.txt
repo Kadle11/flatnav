@@ -61,6 +61,7 @@ endif(OpenMP_FOUND)
 option(BUILD_TESTS "Build all tests")
 option(BUIL_EXAMPLES "Build examples")
 option(NO_SIMD_VECTORIZATION "Disable using SIMD instructions")
+option(FLATNAV_USE_NUMA "Enable NUMA-aware allocation of the index (requires libnuma)" OFF)
 message(STATUS "Building tests: ${BUILD_TESTS}")
 message(STATUS "Building examples: ${BUILD_EXAMPLES}")
 
@@ -100,6 +101,20 @@ target_include_directories(FLAT_NAV_LIB INTERFACE ${PROJECT_SOURCE_DIR})
 
 
 target_link_libraries(FLAT_NAV_LIB INTERFACE OpenMP::OpenMP_CXX)
+
+# NUMA-aware allocation. When enabled, the index data and graph are bound to
+# their respective NUMA nodes via libnuma (see util/NumaAllocation.h). When
+# disabled (the default), allocation falls back to the standard allocator.
+if(FLATNAV_USE_NUMA)
+  find_library(NUMA_LIBRARY NAMES numa)
+  if(NOT NUMA_LIBRARY)
+    message(FATAL_ERROR
+      "FLATNAV_USE_NUMA is ON but libnuma was not found. Install libnuma-dev.")
+  endif()
+  message(STATUS "NUMA-aware allocation enabled: ${NUMA_LIBRARY}")
+  target_compile_definitions(FLAT_NAV_LIB INTERFACE FLATNAV_USE_NUMA)
+  target_link_libraries(FLAT_NAV_LIB INTERFACE ${NUMA_LIBRARY})
+endif()
 
 if(BUILD_EXAMPLES)
   message(STATUS "Building examples")

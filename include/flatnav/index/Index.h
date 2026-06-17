@@ -6,6 +6,7 @@
 #include <flatnav/util/Reordering.h>
 #include <flatnav/util/VisitedSetPool.h>
 #include <flatnav/util/Datatype.h>
+#include <flatnav/util/NumaAllocation.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -32,6 +33,7 @@ using flatnav::distances::DistanceInterface;
 using flatnav::util::VisitedSet;
 using flatnav::util::VisitedSetPool;
 using flatnav::util::DataType;
+using flatnav::util::kNoNumaNode;
 
 namespace flatnav {
 
@@ -57,15 +59,27 @@ class Index {
 
   typedef std::priority_queue<dist_node_t, std::vector<dist_node_t>, CompareByFirst> PriorityQueue;
 
-  // Large (several GB), pre-allocated block of memory.
-  char* _index_memory;
+  // NUMA-aware storage. The data and the graph are kept in two separate,
+  // contiguous (structure-of-arrays) allocations so each can be bound to its
+  // own NUMA node.
+  //   Vectors block: one [data] entry per node,         stride _data_size_bytes.
+  //   Graph block:   one [M links][label] entry per node, stride
+  //                  _graph_node_size_bytes.
+  char* _vectors_memory = nullptr;
+  char* _graph_memory = nullptr;
+  int _vectors_numa_node = kNoNumaNode;
+  int _graph_numa_node = kNoNumaNode;
 
   size_t _M;
   // size of one data point (does not support variable-size data, strings)
   size_t _data_size_bytes;
-  // Node consists of: ([data] [M links] [data label]). This layout was chosen
-  // after benchmarking - it's slightly more cache-efficient than others.
+  // Logical size of a node: [data] + [M links] + [label]. The data lives in
+  // _vectors_memory and the links+label live in _graph_memory, so this is kept
+  // only for reporting/serialization metadata. It satisfies
+  // _node_size_bytes == _data_size_bytes + _graph_node_size_bytes.
   size_t _node_size_bytes;
+  // Size of one entry in _graph_memory: [M links][label].
+  size_t _graph_node_size_bytes;
   size_t _max_node_count;  // Determines size of internal pre-allocated memory
   size_t _cur_num_nodes;
   std::unique_ptr<DistanceInterface<dist_t>> _distance;
@@ -93,7 +107,7 @@ class Index {
   // whether a visited node is a hub node or not.
   std::vector<std::vector<bool>> _visited_nodes_sequence;
 
-  bool* _hub_nodes; // A boolean array to keep track of hub nodes.
+  bool* _hub_nodes = nullptr; // A boolean array to keep track of hub nodes.
   // If a node is a hub, then _hub_nodes[node] = true, else false.
 
   // Tracking metrics for node access patterns. This unordered map is used to
@@ -111,55 +125,73 @@ class Index {
   Index &operator=(const Index &) = delete;
 
   // A custom move constructor is needed because the class manages dynamic
-  // resources (_index_memory, _visited_set_pool),
+  // resources (_vectors_memory, _graph_memory, _visited_set_pool),
   // which require explicit ownership transfer and cleanup to avoid resource
   // leaks or double frees. The default move constructor cannot ensure these
   // resources are safely transferred and the source object is left in a valid
   // state.
   Index(Index&& other) noexcept
-      : _index_memory(other._index_memory),
+      : _vectors_memory(other._vectors_memory),
+        _graph_memory(other._graph_memory),
+        _vectors_numa_node(other._vectors_numa_node),
+        _graph_numa_node(other._graph_numa_node),
         _M(other._M),
         _data_size_bytes(other._data_size_bytes),
         _node_size_bytes(other._node_size_bytes),
+        _graph_node_size_bytes(other._graph_node_size_bytes),
         _max_node_count(other._max_node_count),
         _cur_num_nodes(other._cur_num_nodes),
         _distance(std::move(other._distance)),
         _num_threads(other._num_threads),
         _visited_set_pool(std::move(other._visited_set_pool)),
-        _node_links_mutexes(std::move(other._node_links_mutexes)) {
-    other._index_memory = nullptr;
+        _node_links_mutexes(std::move(other._node_links_mutexes)),
+        _hub_nodes(other._hub_nodes) {
+    other._vectors_memory = nullptr;
+    other._graph_memory = nullptr;
     other._visited_set_pool = nullptr;
+    other._hub_nodes = nullptr;
   }
 
   Index& operator=(Index&& other) noexcept {
     if (this != &other) {
-      delete[] _index_memory;
+      util::freeBytes(_vectors_memory, vectorsMemoryBytes(), _vectors_numa_node);
+      util::freeBytes(_graph_memory, graphMemoryBytes(), _graph_numa_node);
       delete _visited_set_pool;
+      delete[] _hub_nodes;
 
-      _index_memory = other._index_memory;
+      _vectors_memory = other._vectors_memory;
+      _graph_memory = other._graph_memory;
+      _vectors_numa_node = other._vectors_numa_node;
+      _graph_numa_node = other._graph_numa_node;
       _M = other._M;
       _data_size_bytes = other._data_size_bytes;
       _node_size_bytes = other._node_size_bytes;
+      _graph_node_size_bytes = other._graph_node_size_bytes;
       _max_node_count = other._max_node_count;
       _cur_num_nodes = other._cur_num_nodes;
       _distance = std::move(other._distance);
       _num_threads = other._num_threads;
       _visited_set_pool = std::move(other._visited_set_pool);
       _node_links_mutexes = std::move(other._node_links_mutexes);
+      _hub_nodes = other._hub_nodes;
 
-      other._index_memory = nullptr;
+      other._vectors_memory = nullptr;
+      other._graph_memory = nullptr;
       other._visited_set_pool = nullptr;
+      other._hub_nodes = nullptr;
     }
     return *this;
   }
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(_data_type, _M, _data_size_bytes, _node_size_bytes, _max_node_count, _cur_num_nodes, *_distance);
+    archive(_data_type, _M, _data_size_bytes, _node_size_bytes,
+            _graph_node_size_bytes, _max_node_count, _cur_num_nodes, *_distance);
 
-    // Serialize the allocated memory for the index & query.
-    uint64_t total_mem = static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
-    archive(cereal::binary_data(_index_memory, total_mem));
+    // Serialize the two storage regions separately. NUMA placement is a runtime
+    // concern and is intentionally not persisted.
+    archive(cereal::binary_data(_vectors_memory, vectorsMemoryBytes()));
+    archive(cereal::binary_data(_graph_memory, graphMemoryBytes()));
   }
 
  public:
@@ -181,8 +213,11 @@ class Index {
   Index(std::unique_ptr<DistanceInterface<dist_t>> dist, int dataset_size,
         int max_edges_per_node, bool collect_stats = false,
         bool use_random_initialization = false,
-        std::optional<size_t> random_seed = std::nullopt, DataType data_type = DataType::float32)
-      : _M(max_edges_per_node), _max_node_count(dataset_size),
+        std::optional<size_t> random_seed = std::nullopt,
+        DataType data_type = DataType::float32,
+        int vectors_numa_node = kNoNumaNode, int graph_numa_node = kNoNumaNode)
+      : _vectors_numa_node(vectors_numa_node), _graph_numa_node(graph_numa_node),
+        _M(max_edges_per_node), _max_node_count(dataset_size),
         _cur_num_nodes(0), _distance(std::move(dist)), _num_threads(1),
         _visited_set_pool(new VisitedSetPool(
             /* initial_pool_size = */ 1,
@@ -199,10 +234,13 @@ class Index {
     initNodeAccessCounts();
 
     _data_size_bytes = _distance->dataSize();
-    _node_size_bytes =
-        _data_size_bytes + (sizeof(node_id_t) * _M) + sizeof(label_t);
-    uint64_t index_size = static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
-    _index_memory = new char[index_size];
+    _graph_node_size_bytes = (sizeof(node_id_t) * _M) + sizeof(label_t);
+    _node_size_bytes = _data_size_bytes + _graph_node_size_bytes;
+
+    _vectors_memory =
+        util::allocateBytes(vectorsMemoryBytes(), _vectors_numa_node);
+    _graph_memory = util::allocateBytes(graphMemoryBytes(), _graph_numa_node);
+
     _hub_nodes = new bool[_max_node_count];
     std::fill_n(_hub_nodes, _max_node_count, false);
   }
@@ -215,9 +253,10 @@ class Index {
   }
 
   ~Index() {
-    delete[] _index_memory;
+    util::freeBytes(_vectors_memory, vectorsMemoryBytes(), _vectors_numa_node);
+    util::freeBytes(_graph_memory, graphMemoryBytes(), _graph_numa_node);
     delete _visited_set_pool;
-    delete _hub_nodes;
+    delete[] _hub_nodes;
   }
 
   /**
@@ -559,12 +598,13 @@ class Index {
     std::unique_ptr<DistanceInterface<dist_t>> dist = std::make_unique<dist_t>();
 
     // 1. Deserialize metadata
-    archive(index->_data_type, 
-            index->_M, 
-            index->_data_size_bytes, 
-            index->_node_size_bytes, 
+    archive(index->_data_type,
+            index->_M,
+            index->_data_size_bytes,
+            index->_node_size_bytes,
+            index->_graph_node_size_bytes,
             index->_max_node_count,
-            index->_cur_num_nodes, 
+            index->_cur_num_nodes,
             *dist
     );
     index->_visited_set_pool = new VisitedSetPool(
@@ -574,13 +614,21 @@ class Index {
     index->_num_threads = std::max((uint32_t)1, (uint32_t)std::thread::hardware_concurrency() / 2);
     index->_node_links_mutexes = std::vector<std::mutex>(index->_max_node_count);
 
-    // 2. Allocate memory using deserialized metadata
-    uint64_t mem_size = static_cast<uint64_t>(index->_node_size_bytes) * static_cast<uint64_t>(index->_max_node_count);
+    // Hub-node flags are not serialized; a loaded index starts with no hubs
+    // marked (matching a freshly constructed index before setHubNodeFlags).
+    index->_hub_nodes = new bool[index->_max_node_count];
+    std::fill_n(index->_hub_nodes, index->_max_node_count, false);
 
-    index->_index_memory = new char[mem_size];
+    // 2. Allocate the two storage regions using deserialized metadata. Loaded
+    // indexes use the standard allocator (NUMA placement is not persisted).
+    index->_vectors_memory =
+        util::allocateBytes(index->vectorsMemoryBytes(), index->_vectors_numa_node);
+    index->_graph_memory =
+        util::allocateBytes(index->graphMemoryBytes(), index->_graph_numa_node);
 
-    // 3. Deserialize content into allocated memory
-    archive(cereal::binary_data(index->_index_memory, mem_size));
+    // 3. Deserialize content into the allocated regions.
+    archive(cereal::binary_data(index->_vectors_memory, index->vectorsMemoryBytes()));
+    archive(cereal::binary_data(index->_graph_memory, index->graphMemoryBytes()));
 
     return index;
   }
@@ -611,6 +659,16 @@ class Index {
 
   inline uint64_t getTotalIndexMemory() const {
     return static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
+  }
+
+  // Byte size of the vectors region ([data] per node).
+  inline uint64_t vectorsMemoryBytes() const {
+    return static_cast<uint64_t>(_data_size_bytes) * static_cast<uint64_t>(_max_node_count);
+  }
+
+  // Byte size of the graph region ([M links][label] per node).
+  inline uint64_t graphMemoryBytes() const {
+    return static_cast<uint64_t>(_graph_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
   }
   inline uint64_t mutexesAllocatedMemory() const {
     return static_cast<uint64_t>(_node_links_mutexes.size() * sizeof(std::mutex));
@@ -666,22 +724,20 @@ class Index {
   Index() = default;
 
   char* getNodeData(const node_id_t& n) const {
-    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
-    return _index_memory + byte_offset;
+    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_data_size_bytes);
+    return _vectors_memory + byte_offset;
   }
 
   node_id_t* getNodeLinks(const node_id_t& n) const {
-    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
-    byte_offset += _data_size_bytes;
-    char* location = _index_memory + byte_offset;
+    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_graph_node_size_bytes);
+    char* location = _graph_memory + byte_offset;
     return reinterpret_cast<node_id_t*>(location);
   }
 
   label_t* getNodeLabel(const node_id_t& n) const {
-    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
-    byte_offset += _data_size_bytes;
+    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_graph_node_size_bytes);
     byte_offset += (_M * sizeof(node_id_t));
-    char* location = _index_memory + byte_offset;
+    char* location = _graph_memory + byte_offset;
     return reinterpret_cast<label_t*>(location);
   }
 
