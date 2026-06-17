@@ -38,7 +38,12 @@ struct SquaredL2Impl {
 // Specialization of SquaredL2Impl for the float type.
 template <>
 struct SquaredL2Impl<float> {
-  static float computeDistance(const float* x, const float* y, const size_t& dimension) {
+  static
+#ifdef FLATNAV_PROFILE_NOINLINE
+      __attribute__((noinline))
+#endif
+      float
+      computeDistance(const float* x, const float* y, const size_t& dimension) {
 #if defined(USE_AVX512)
     if (platformSupportsAvx512()) {
       if (dimension % 16 == 0) {
