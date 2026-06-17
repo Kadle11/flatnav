@@ -785,7 +785,7 @@ class Index {
     visited_set->clear();
 
     // Prefetch the data for entry node before computing its distance.
-#ifdef USE_SSE
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
     _mm_prefetch(getNodeData(entry_node), _MM_HINT_T0);
 #endif
 
@@ -812,7 +812,7 @@ class Index {
       // distance. In that case we would have prefetched data that is not used
       // immediately, but I think the cost of prefetching is low enough that
       // it's probably worth it.
-#ifdef USE_SSE
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
       if (!candidates.empty()) {
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
         visited_set->prefetch(candidates.top().second);
@@ -839,8 +839,14 @@ class Index {
                             const int buffer_size, VisitedSet *visited_set,
                             PriorityQueue &neighbors,
                             PriorityQueue &candidates, std::vector<bool>& query_visited_nodes_flags) {
-    // Lock all operations on this specific node
-    std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
+    // Lock all operations on this specific node. During search the graph is
+    // frozen (read-only), so the per-node lock is pure overhead and is skipped;
+    // it is only needed during construction (is_search_stage == false) to guard
+    // concurrent writers.
+    std::unique_lock<std::mutex> lock(_node_links_mutexes[node], std::defer_lock);
+    if constexpr (!is_search_stage) {
+      lock.lock();
+    }
 
     node_id_t *neighbor_node_links = getNodeLinks(node);
     query_visited_nodes_flags.push_back(_hub_nodes[node]);  
@@ -849,7 +855,7 @@ class Index {
 
       // If using SSE, prefetch the next neighbor node data and the visited
       // marker
-#ifdef USE_SSE
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
       if (i != _M - 1) {
         _mm_prefetch(getNodeData(neighbor_node_links[i + 1]), _MM_HINT_T0);
         visited_set->prefetch(neighbor_node_links[i + 1]);
@@ -874,7 +880,7 @@ class Index {
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
         // query_visited_nodes_flags.push_back(_hub_nodes[neighbor_node_id]);
-#ifdef USE_SSE
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
 #endif
         if (neighbors.size() > buffer_size) {
