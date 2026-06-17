@@ -835,6 +835,9 @@ class Index {
   }
 
   template <bool is_search_stage>
+#ifdef FLATNAV_PROFILE_NOINLINE
+  __attribute__((noinline))
+#endif
   void processCandidateNode(const void *query, node_id_t &node, float &max_dist,
                             const int buffer_size, VisitedSet *visited_set,
                             PriorityQueue &neighbors,

@@ -9,6 +9,7 @@
 #include <flatnav/distances/SquaredL2Distance.h>
 #include <flatnav/index/Index.h>
 #include <flatnav/util/Multithreading.h>
+#include <flatnav/util/NumaThreadPool.h>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -87,6 +88,13 @@ int main(int argc, char** argv) {
     efs = {10, 20, 40, 80, 120};
   }
 
+  // Monotonic start reference. Phase markers below print elapsed seconds since
+  // here, which aligns with `perf stat -I`'s interval timestamps (both count
+  // from ~process start), so perf intervals can be accrued strictly after the
+  // load phase without any fixed-delay guess.
+  auto prog_start = clk::now();
+  auto elapsed = [&] { return std::chrono::duration<double>(clk::now() - prog_start).count(); };
+
   int qdim; size_t nq;
   std::vector<float> queries = readFvecs(query_path, qdim, nq);
   int gw; size_t ngt;
@@ -100,6 +108,7 @@ int main(int argc, char** argv) {
   printf("[load] index in %.1fs: cur_nodes=%zu dim=%zu threads=%d K=%d\n",
          std::chrono::duration<double>(clk::now() - l0).count(),
          index->currentNumNodes(), index->dataDimension(), threads, K);
+  printf("[phase] load_done elapsed_s=%.3f\n", elapsed());
   fflush(stdout);
 
   // Precompute ground-truth top-K sets per query.
@@ -109,20 +118,37 @@ int main(int argc, char** argv) {
 
   std::vector<std::vector<std::pair<float, int>>> results(nq);
 
+  // Optional per-core thread pinning via FLATNAV_PIN_CPUS (comma-separated cpu
+  // list). When set, the worker count equals the number of pinned cpus and each
+  // worker is bound to a fixed core (stable for perf attribution, NUMA-local).
+  const char* pin_env = getenv("FLATNAV_PIN_CPUS");
+  std::vector<int> pin_cpus = flatnav::parseCpuList(pin_env);
+  bool pinned = !pin_cpus.empty();
+  if (pinned) {
+    threads = static_cast<int>(pin_cpus.size());
+    printf("[pin] %zu cores: %s\n", pin_cpus.size(), pin_env);
+    fflush(stdout);
+  }
+
+  auto runBatch = [&](int ef) {
+    auto body = [&](uint32_t i) {
+      const float* q = &queries[(size_t)i * qdim];
+      results[i] = index->search(reinterpret_cast<const void*>(q), K, ef);
+    };
+    if (pinned) flatnav::executeInParallelPinned(0, nq, pin_cpus, body);
+    else flatnav::executeInParallel(0, nq, threads, body);
+  };
+
   // Warmup: fault the index working set into caches/TLB so the first measured
   // ef isn't penalized by cold-start cost.
-  flatnav::executeInParallel(0, nq, threads, [&](uint32_t i) {
-    const float* q = &queries[(size_t)i * qdim];
-    results[i] = index->search(reinterpret_cast<const void*>(q), K, efs.back());
-  });
+  runBatch(efs.back());
+  printf("[phase] warmup_done elapsed_s=%.3f\n", elapsed());
+  fflush(stdout);
 
   printf("%-8s %-12s %-12s %-10s\n", "ef", "time_s", "QPS", "recall@K");
   for (int ef : efs) {
     auto t0 = clk::now();
-    flatnav::executeInParallel(0, nq, threads, [&](uint32_t i) {
-      const float* q = &queries[(size_t)i * qdim];
-      results[i] = index->search(reinterpret_cast<const void*>(q), K, ef);
-    });
+    runBatch(ef);
     double dt = std::chrono::duration<double>(clk::now() - t0).count();
 
     size_t hits = 0, total = 0;
