@@ -49,7 +49,9 @@ def read_bvecs_file(filename: str, range: Optional[tuple[int, int]] = None) -> n
 
 def read_fvecs_file(filename: str, range: Optional[tuple[int, int]] = None) -> np.ndarray:
     with open(filename, "rb") as f:
-        dimension = np.fromfile(f, dtype=np.int32, count=1)[0]
+        # int() so vec_size / offsets are Python ints; otherwise np.int32 arithmetic
+        # overflows for files > 2 GB (e.g. the 51.6 GB SIFT100M base).
+        dimension = int(np.fromfile(f, dtype=np.int32, count=1)[0])
         vec_size = (dimension + 1) * 4
 
         f.seek(0, 2)

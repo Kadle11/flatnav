@@ -246,12 +246,15 @@ def run_recall_only_batched(
             batch = queries[start_idx:end_idx]
             try:
                 t0 = time.perf_counter()
-                res0, res1 = index.search(queries=batch, K=effective_k, ef_search=ef_search, num_initializations=100)
+                distances, res_labels = index.search(queries=batch, K=effective_k, ef_search=ef_search, num_initializations=100)
                 dt_ms = (time.perf_counter() - t0) * 1000.0
                 per_query_ms = dt_ms / float(end_idx - start_idx)
                 times_ms.extend([per_query_ms] * (end_idx - start_idx))
 
-                batch_labels = res0.astype(np.int32)
+                # search() returns (distances, labels) per DistancesLabelsPair; labels
+                # are the 2nd element. (Reading the 1st here was the consumer half of
+                # the float32 label-corruption bug.)
+                batch_labels = res_labels.astype(np.int32)
 
                 # batch_labels shape should be (batch_size, K)
                 for j in range(end_idx - start_idx):

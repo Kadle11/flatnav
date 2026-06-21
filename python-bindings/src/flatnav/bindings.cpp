@@ -228,7 +228,10 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::array_t<float> dists = py::array_t<float>(
         {num_queries, (size_t)K}, {K * sizeof(float), sizeof(float)}, distances, free_distances_when_done);
 
-    return {labels, dists};
+    // DistancesLabelsPair is (distances, labels). Returning {labels, dists} here
+    // silently casts the int label array to float32 (and distances to int),
+    // corrupting label ids >= 2^24 (float mantissa limit) for datasets > ~16.7M.
+    return {dists, labels};
   }
 
  public:
