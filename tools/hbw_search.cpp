@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -103,12 +104,31 @@ int main(int argc, char** argv) {
   fflush(stdout);
   if (ngt < nq) { fprintf(stderr, "gtruth rows < queries\n"); return 1; }
 
+  // Optional per-region NUMA placement for the caching study (requires building
+  // with -DFLATNAV_USE_NUMA -lnuma). Unset => default allocator (single-node).
+  //   FLATNAV_GRAPH_NUMA=<node>   place graph links on this node (the local cache)
+  //   FLATNAV_VECTORS_NUMA=<node> place vectors on this node (e.g. remote)
+  const char* gnuma = getenv("FLATNAV_GRAPH_NUMA");
+  const char* vnuma = getenv("FLATNAV_VECTORS_NUMA");
+  int graph_node = gnuma ? atoi(gnuma) : -1;
+  int vec_node = vnuma ? atoi(vnuma) : -1;
+
   auto l0 = clk::now();
-  auto index = Index<dist_t, int>::loadIndex(index_path);
+  auto index = Index<dist_t, int>::loadIndex(index_path, vec_node, graph_node);
+  printf("[numa] vectors_node=%d graph_node=%d\n", vec_node, graph_node);
   printf("[load] index in %.1fs: cur_nodes=%zu dim=%zu threads=%d K=%d\n",
          std::chrono::duration<double>(clk::now() - l0).count(),
          index->currentNumNodes(), index->dataDimension(), threads, K);
   printf("[phase] load_done elapsed_s=%.3f\n", elapsed());
+
+  // Design-1 SSSP: optional fixed common source for all queries.
+  //   FLATNAV_FIXED_ENTRY=<node_id>  or  FLATNAV_FIXED_ENTRY=medoid
+  const char* fe = getenv("FLATNAV_FIXED_ENTRY");
+  if (fe) {
+    long S = (strcmp(fe, "medoid") == 0) ? (long)index->computeMedoid() : atol(fe);
+    index->setFixedEntryNode(S);
+    printf("[sssp] fixed common source S=%ld\n", S);
+  }
   fflush(stdout);
 
   // Precompute ground-truth top-K sets per query.

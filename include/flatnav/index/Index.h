@@ -115,6 +115,20 @@ class Index {
   // node id and the value is the number of times the node is visited.
   std::unordered_map<uint32_t, uint32_t> _node_access_counts;
 
+  // Optional flat per-node graph-link visit counter for the caching study.
+  // Allocated only when enableVisitProfiling() is called (400 MB at 100M nodes);
+  // incremented in processCandidateNode (hot path) only under FLATNAV_PROFILE_VISITS,
+  // so non-profiling builds are byte-identical on the search path.
+  std::atomic<uint32_t>* _node_visit_counts = nullptr;
+  // Companion counter: per-node DATA (vector) accesses = full activated footprint
+  // (superset of link-expanded nodes). Also allocated by enableVisitProfiling().
+  std::atomic<uint32_t>* _node_data_counts = nullptr;
+
+  // Design-1 (SSSP) common source: when >= 0, every search starts from this fixed
+  // entry node (skipping the per-query initialization scan), so all traversals are
+  // rooted at one vertex. Set via setFixedEntryNode(); -1 = normal per-query entry.
+  int64_t _fixed_entry_node = -1;
+
   // Randomization parameters
   bool _use_random_initialization = false;
   std::mt19937 _generator;
@@ -257,6 +271,8 @@ class Index {
     util::freeBytes(_graph_memory, graphMemoryBytes(), _graph_numa_node);
     delete _visited_set_pool;
     delete[] _hub_nodes;
+    delete[] _node_visit_counts;
+    delete[] _node_data_counts;
   }
 
   /**
@@ -302,6 +318,59 @@ class Index {
   }
 
   void resetNodeAccessDistribution() { _node_access_counts.clear(); }
+
+  // Caching study: allocate the flat per-node link-expansion + data-access counters (zeroed).
+  void enableVisitProfiling() {
+    delete[] _node_visit_counts;
+    delete[] _node_data_counts;
+    _node_visit_counts = new std::atomic<uint32_t>[_max_node_count]();
+    _node_data_counts = new std::atomic<uint32_t>[_max_node_count]();
+  }
+  const std::atomic<uint32_t>* nodeVisitCounts() const { return _node_visit_counts; }
+  const std::atomic<uint32_t>* nodeDataCounts() const { return _node_data_counts; }
+
+  // Design-1 SSSP: fix the common source vertex for all subsequent searches.
+  void setFixedEntryNode(int64_t s) { _fixed_entry_node = s; }
+
+  // Medoid = node nearest to the dataset mean vector (a principled central source).
+  // Two streaming passes over the vectors.
+  node_id_t computeMedoid() {
+    const size_t dim = _data_size_bytes / sizeof(float);
+    std::vector<double> mean(dim, 0.0);
+    for (node_id_t n = 0; n < _cur_num_nodes; n++) {
+      const float* v = reinterpret_cast<const float*>(getNodeData(n));
+      for (size_t d = 0; d < dim; d++) mean[d] += v[d];
+    }
+    std::vector<float> m(dim);
+    for (size_t d = 0; d < dim; d++) m[d] = static_cast<float>(mean[d] / (double)_cur_num_nodes);
+    node_id_t best = 0; double best_dist = std::numeric_limits<double>::max();
+    for (node_id_t n = 0; n < _cur_num_nodes; n++) {
+      const float* v = reinterpret_cast<const float*>(getNodeData(n));
+      double s = 0;
+      for (size_t d = 0; d < dim; d++) { double diff = (double)v[d] - m[d]; s += diff * diff; }
+      if (s < best_dist) { best_dist = s; best = n; }
+    }
+    return best;
+  }
+
+  // Hop (graph-BFS) distance from `source` to every node over out-edges; 255 = unreachable.
+  std::vector<uint8_t> bfsHopDistances(node_id_t source) {
+    std::vector<uint8_t> dist(_cur_num_nodes, 255);
+    std::vector<node_id_t> frontier, next;
+    dist[source] = 0; frontier.push_back(source);
+    uint8_t h = 0;
+    while (!frontier.empty() && h < 254) {
+      for (node_id_t u : frontier) {
+        const node_id_t* links = getNodeLinks(u);
+        for (uint32_t i = 0; i < _M; i++) {
+          node_id_t w = links[i];
+          if (w < _cur_num_nodes && dist[w] == 255) { dist[w] = h + 1; next.push_back(w); }
+        }
+      }
+      frontier.swap(next); next.clear(); h++;
+    }
+    return dist;
+  }
 
   void setHubNodeFlags(const std::vector<uint32_t>& hub_nodes) {
       for (const auto& hub_node: hub_nodes) {
@@ -527,7 +596,9 @@ class Index {
   std::vector<dist_label_t> search(const void* query, const int K, int ef_search,
                                    int num_initializations = 100) {
     node_id_t entry_node;
-    if (_use_random_initialization) {
+    if (_fixed_entry_node >= 0) {
+      entry_node = static_cast<node_id_t>(_fixed_entry_node);
+    } else if (_use_random_initialization) {
       entry_node = randomlyInitializeSearch(query, num_initializations);
     } else {
       entry_node = initializeSearch(query, num_initializations);
@@ -585,7 +656,14 @@ class Index {
     relabel(P);
   }
 
-  static std::unique_ptr<Index<dist_t, label_t>> loadIndex(const std::string& filename) {
+  // NUMA placement (vectors_numa_node, graph_numa_node) lets the caller bind each
+  // storage region to a specific NUMA node at load time (caching study: hot graph
+  // links on the local node, vectors on the remote node). kNoNumaNode = default
+  // allocator. Requires building with FLATNAV_USE_NUMA.
+  static std::unique_ptr<Index<dist_t, label_t>> loadIndex(
+      const std::string& filename,
+      int vectors_numa_node = util::kNoNumaNode,
+      int graph_numa_node = util::kNoNumaNode) {
     std::ifstream stream(filename, std::ios::binary);
 
     if (!stream.is_open()) {
@@ -619,8 +697,11 @@ class Index {
     index->_hub_nodes = new bool[index->_max_node_count];
     std::fill_n(index->_hub_nodes, index->_max_node_count, false);
 
-    // 2. Allocate the two storage regions using deserialized metadata. Loaded
-    // indexes use the standard allocator (NUMA placement is not persisted).
+    // 2. Allocate the two storage regions using deserialized metadata. NUMA
+    // placement is not persisted; the caller may bind each region via the
+    // loadIndex(filename, vectors_node, graph_node) overload.
+    index->_vectors_numa_node = vectors_numa_node;
+    index->_graph_numa_node = graph_numa_node;
     index->_vectors_memory =
         util::allocateBytes(index->vectorsMemoryBytes(), index->_vectors_numa_node);
     index->_graph_memory =
@@ -791,6 +872,9 @@ class Index {
 
     float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
                                      /* asymmetric = */ true);
+#ifdef FLATNAV_PROFILE_VISITS
+    if (_node_data_counts) _node_data_counts[entry_node].fetch_add(1, std::memory_order_relaxed);
+#endif
 
     float max_dist = dist;
     candidates.emplace(-dist, entry_node);
@@ -852,7 +936,11 @@ class Index {
     }
 
     node_id_t *neighbor_node_links = getNodeLinks(node);
-    query_visited_nodes_flags.push_back(_hub_nodes[node]);  
+#ifdef FLATNAV_PROFILE_VISITS
+    // Count this node's graph-link access (the tiered/cached quantity).
+    if (_node_visit_counts) _node_visit_counts[node].fetch_add(1, std::memory_order_relaxed);
+#endif
+    query_visited_nodes_flags.push_back(_hub_nodes[node]);
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
 
@@ -871,6 +959,11 @@ class Index {
         continue;
       }
       visited_set->insert(/* num = */ neighbor_node_id);
+#ifdef FLATNAV_PROFILE_VISITS
+      // Count this neighbor's DATA (vector) access — the full activated footprint,
+      // a superset of link-expanded nodes (these neighbors may never be expanded).
+      if (_node_data_counts) _node_data_counts[neighbor_node_id].fetch_add(1, std::memory_order_relaxed);
+#endif
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(neighbor_node_id),
                                  /* asymmetric = */ true);
