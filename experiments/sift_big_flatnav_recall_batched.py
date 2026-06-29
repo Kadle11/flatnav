@@ -31,6 +31,11 @@ def compute_recall_at_k(found: np.ndarray, truth: np.ndarray, k: int) -> float:
     return len(found_set.intersection(truth_set)) / float(k)
 
 
+# Monotonic process-start reference; phase markers print elapsed seconds from here
+# so a wrapping `perf stat -I` can slice DRAM-bandwidth intervals per batch-size phase.
+_PROG_START = time.monotonic()
+
+
 def _to_float32_contiguous(batch: np.ndarray) -> np.ndarray:
     if batch.dtype == np.float32 and batch.flags.c_contiguous:
         return batch
@@ -168,7 +173,7 @@ def run_recall_only_batched(
     existing_mtx: str,
     num_queries: int,
     k: int,
-    search_batch_size: int = 128,
+    search_batch_sizes: List[int] = None,
     search_only: bool = False,
     exp_id: str = "",
 ) -> Dict[str, object]:
@@ -232,58 +237,70 @@ def run_recall_only_batched(
         logging.info("Running batched queries without signaling for search-only benchmarking.")
 
     results: Dict[str, Dict[str, float]] = {}
+    num_queries_total = len(queries)
+    # Resolve the per-search batch-size sweep (-1 sentinel => "max" = all queries).
+    if not search_batch_sizes:
+        search_batch_sizes = [128]
+    resolved_sbs = [num_queries_total if s < 0 else min(s, num_queries_total)
+                    for s in search_batch_sizes]
 
-    for ef_search in ef_search_values:
-        logging.info("Running batched queries with ef_search=%d", ef_search)
-        start = time.time()
-        recalls: List[float] = []
-        times_ms: List[float] = []
-        failed_batches = 0
-        num_queries_total = len(queries)
+    for search_batch_size in resolved_sbs:
+        # Phase marker (elapsed from process start) so a wrapping perf -I can slice
+        # DRAM bandwidth to this batch-size phase.
+        print(f"[phase] sbs={search_batch_size} start elapsed_s={time.monotonic()-_PROG_START:.3f}",
+              flush=True)
+        for ef_search in ef_search_values:
+            logging.info("Running batched queries sbs=%d ef_search=%d", search_batch_size, ef_search)
+            times_ms: List[float] = []
+            failed_batches = 0
+            collected = []  # (start_idx, end_idx, labels) — recall deferred out of the timed window
 
-        for start_idx in range(0, num_queries_total, search_batch_size):
-            end_idx = min(start_idx + search_batch_size, num_queries_total)
-            batch = queries[start_idx:end_idx]
-            try:
-                t0 = time.perf_counter()
-                distances, res_labels = index.search(queries=batch, K=effective_k, ef_search=ef_search, num_initializations=100)
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                per_query_ms = dt_ms / float(end_idx - start_idx)
-                times_ms.extend([per_query_ms] * (end_idx - start_idx))
+            # --- pure search window (recall computed AFTER, so batch size is the only
+            #     thing varying inside the timed/perf-measured region) ---
+            search_start = time.time()
+            print(f"[phase] sbs={search_batch_size} ef={ef_search} search_start elapsed_s={time.monotonic()-_PROG_START:.3f}",
+                  flush=True)
+            for start_idx in range(0, num_queries_total, search_batch_size):
+                end_idx = min(start_idx + search_batch_size, num_queries_total)
+                batch = queries[start_idx:end_idx]
+                try:
+                    t0 = time.perf_counter()
+                    distances, res_labels = index.search(queries=batch, K=effective_k, ef_search=ef_search, num_initializations=100)
+                    dt_ms = (time.perf_counter() - t0) * 1000.0
+                    per_query_ms = dt_ms / float(end_idx - start_idx)
+                    times_ms.extend([per_query_ms] * (end_idx - start_idx))
+                    # search() returns (distances, labels); labels are the 2nd element.
+                    collected.append((start_idx, end_idx, res_labels.astype(np.int32)))
+                except RuntimeError:
+                    failed_batches += 1
+                    continue
+            search_sec = time.time() - search_start
+            print(f"[phase] sbs={search_batch_size} ef={ef_search} search_done elapsed_s={time.monotonic()-_PROG_START:.3f}",
+                  flush=True)
 
-                # search() returns (distances, labels) per DistancesLabelsPair; labels
-                # are the 2nd element. (Reading the 1st here was the consumer half of
-                # the float32 label-corruption bug.)
-                batch_labels = res_labels.astype(np.int32)
+            # --- recall (outside the perf/QPS window) ---
+            recalls: List[float] = []
+            for s_idx, e_idx, batch_labels in collected:
+                for j in range(e_idx - s_idx):
+                    recalls.append(compute_recall_at_k(batch_labels[j], ground_truth[s_idx + j], effective_k))
 
-                # batch_labels shape should be (batch_size, K)
-                for j in range(end_idx - start_idx):
-                    recalls.append(compute_recall_at_k(batch_labels[j], ground_truth[start_idx + j], effective_k))
-    
-            except RuntimeError:
-                failed_batches += 1
-                continue
-
-        total_sec = time.time() - start
-        avg_recall = float(np.mean(recalls)) if recalls else 0.0
-        results[str(ef_search)] = {
-            "recall": avg_recall,
-            "total_time_sec": total_sec,
-            "avg_time_ms_per_query": float(np.mean(times_ms)) if times_ms else 0.0,
-            "p99_time_ms": float(np.percentile(times_ms, 99)) if times_ms else 0.0,
-            "failed_batches": failed_batches,
-            "qps": num_queries_total / total_sec if total_sec > 0 else 0.0,
-        }
-        logging.info(
-            "ef_search=%d recall@%d=%.6f total_time=%.2fs failed_batches=%d p99_ms=%.3f qps=%.2f",
-            ef_search,
-            effective_k,
-            avg_recall,
-            total_sec,
-            failed_batches,
-            results[str(ef_search)]["p99_time_ms"],
-            num_queries_total / total_sec if total_sec > 0 else 0.0,
-        )
+            avg_recall = float(np.mean(recalls)) if recalls else 0.0
+            key = f"sbs{search_batch_size}_ef{ef_search}"
+            results[key] = {
+                "search_batch_size": search_batch_size,
+                "ef": ef_search,
+                "recall": avg_recall,
+                "search_time_sec": search_sec,
+                "avg_time_ms_per_query": float(np.mean(times_ms)) if times_ms else 0.0,
+                "p99_time_ms": float(np.percentile(times_ms, 99)) if times_ms else 0.0,
+                "failed_batches": failed_batches,
+                "qps": num_queries_total / search_sec if search_sec > 0 else 0.0,
+            }
+            logging.info(
+                "sbs=%d ef_search=%d recall@%d=%.6f search_time=%.2fs failed_batches=%d p99_ms=%.3f qps=%.2f",
+                search_batch_size, ef_search, effective_k, avg_recall, search_sec,
+                failed_batches, results[key]["p99_time_ms"], results[key]["qps"],
+            )
 
     del index
     gc.collect()
@@ -325,7 +342,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-mtx", default="")
     parser.add_argument("--num-queries", type=int, default=0)
     parser.add_argument("--k", type=int, default=100)
-    parser.add_argument("--search-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--search-batch-size", default="128",
+        help="Per-search batch size(s); comma list allowed, 'max' = all queries in one batch "
+             "(e.g. --search-batch-size 1,128,1024,max). Sweeps within one build.",
+    )
     parser.add_argument(
         "--search-only",
         action="store_true",
@@ -344,6 +365,12 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
+    # Parse the batch-size sweep: comma list; 'max' => -1 sentinel (resolved to num_queries).
+    search_batch_sizes = [
+        -1 if t.strip().lower() == "max" else int(t.strip())
+        for t in str(args.search_batch_size).split(",") if t.strip()
+    ]
+
     summary = run_recall_only_batched(
         dataset_path=args.dataset,
         queries_path=args.queries,
@@ -360,7 +387,7 @@ def main() -> None:
         existing_mtx=args.existing_mtx,
         num_queries=args.num_queries,
         k=args.k,
-        search_batch_size=args.search_batch_size,
+        search_batch_sizes=search_batch_sizes,
         search_only=args.search_only,
         exp_id=args.exp_id,
     )

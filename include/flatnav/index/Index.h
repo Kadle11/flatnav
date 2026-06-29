@@ -37,6 +37,47 @@ using flatnav::util::kNoNumaNode;
 
 namespace flatnav {
 
+#ifdef FLATNAV_PROFILE_PQ
+// Candidate-PQ residency instrumentation (tier-prefetch study). A node's prefetch
+// lead time = its PQ residency = (pop_step - discovery_step). Per-thread maps track
+// discovery step + parent residency; global atomic histograms aggregate across queries.
+inline constexpr int kPQHistCap = 4096;
+inline std::atomic<uint64_t> g_pq_residency_hist[kPQHistCap];     // residency of every expanded node
+inline std::atomic<uint64_t> g_leapfrog_parent_hist[kPQHistCap];  // parent residency of residency==1 nodes
+// Per-search-step (pop/hop index) buckets, for the early-vs-late predictability split.
+inline constexpr int kPQStepCap = 1024;
+inline std::atomic<uint64_t> g_step_count[kPQStepCap];   // # expansions at this step
+inline std::atomic<uint64_t> g_step_leap[kPQStepCap];    // of those, residency==1 (leapfroggers)
+inline std::atomic<uint64_t> g_step_sumres[kPQStepCap];  // sum of residency (for mean)
+inline thread_local std::unordered_map<uint32_t, uint32_t> tl_disc;        // node -> discovery step
+inline thread_local std::unordered_map<uint32_t, uint32_t> tl_parent_res;  // node -> parent's residency
+inline thread_local uint32_t tl_step;          // pops done so far this query
+inline thread_local uint32_t tl_cur_residency; // residency of the node currently being expanded
+// "top-K candidate prefetch" policy: each step, just after the current node is popped (and BEFORE
+// its neighbors are discovered), we'd prefetch the K closest pending candidates. Because the snapshot
+// is taken pre-expansion, this step's leapfroggers (not yet born) are excluded from every K. A node
+// is "prefetched" once, at the first step it enters the top-K. success = eventually popped; waste =
+// never popped. Buckets keyed by first-prefetch step; lead = pop_step - first_prefetch_step.
+inline constexpr int kPFnumK = 4;
+inline constexpr int kPFK[kPFnumK] = {1, 5, 10, 50};
+inline std::atomic<uint64_t> g_pf_prefetched[kPFnumK][kPQStepCap];
+inline std::atomic<uint64_t> g_pf_success[kPFnumK][kPQStepCap];
+inline std::atomic<uint64_t> g_pf_leadsum[kPFnumK];
+struct PFEntry {
+  uint16_t fe[kPFnumK] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}; // first step entered top-K (0xFFFF=never)
+  uint16_t pop_step = 0;
+  bool popped = false;
+};
+inline thread_local std::unordered_map<uint32_t, PFEntry> tl_pf;
+// Pre-expansion K=1 NEXT-STEP precision: at each step we prefetch the 2nd-min (next candidate);
+// did exactly that node get popped at the immediately next step? (= used with 1-step lead, the
+// strictest "is the next vector known" test). Bucketed by the prefetch step.
+inline std::atomic<uint64_t> g_pf1_next_total[kPQStepCap];
+inline std::atomic<uint64_t> g_pf1_next_hit[kPQStepCap];
+inline thread_local uint32_t tl_pf1_node;   // 2nd-min prefetched last step
+inline thread_local uint32_t tl_pf1_step;   // the step it was prefetched at
+inline thread_local bool tl_pf1_valid;
+#endif
 
 // dist_t: A distance function implementing DistanceInterface.
 // label_t: A fixed-width data type for the label (meta-data) of each point.
@@ -351,6 +392,23 @@ class Index {
       if (s < best_dist) { best_dist = s; best = n; }
     }
     return best;
+  }
+
+  // Public access to relabel for external placement policies (P[old]=new id).
+  void reorderByPermutation(const std::vector<node_id_t>& P) { relabel(P); }
+
+  // In-degree of every node = number of incoming out-edges from other nodes
+  // (self-loops excluded). A "hub" is then defined as a top-percentile in-degree node.
+  std::vector<uint32_t> computeInDegrees() {
+    std::vector<uint32_t> indeg(_cur_num_nodes, 0);
+    for (node_id_t u = 0; u < _cur_num_nodes; u++) {
+      const node_id_t* links = getNodeLinks(u);
+      for (uint32_t i = 0; i < _M; i++) {
+        node_id_t w = links[i];
+        if (w < _cur_num_nodes && w != u) indeg[w]++;
+      }
+    }
+    return indeg;
   }
 
   // Hop (graph-BFS) distance from `source` to every node over out-edges; 255 = unreachable.
@@ -772,6 +830,11 @@ class Index {
   inline size_t currentNumNodes() const { return _cur_num_nodes; }
   inline size_t dataDimension() const { return _distance->dimension(); }
 
+  // Region pointers + graph stride — for external NUMA tiering (mbind) after relabel.
+  inline char* vectorsMemory() const { return _vectors_memory; }
+  inline char* graphMemory() const { return _graph_memory; }
+  inline size_t graphNodeSizeBytes() const { return _graph_node_size_bytes; }
+
   inline uint64_t distanceComputations() const { return _distance_computations.load(); }
 
   inline DataType getDataType() const { return _data_type; }
@@ -879,8 +942,14 @@ class Index {
     float max_dist = dist;
     candidates.emplace(-dist, entry_node);
     neighbors.emplace(dist, entry_node);
-    query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);  
+    query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);
     visited_set->insert(entry_node);
+#ifdef FLATNAV_PROFILE_PQ
+    tl_disc.clear(); tl_parent_res.clear(); tl_step = 0; tl_cur_residency = 0;
+    tl_disc[entry_node] = 0; tl_parent_res[entry_node] = 0;
+    tl_pf.clear();
+    tl_pf1_valid = false;
+#endif
 
     while (!candidates.empty()) {
       auto [distance, node] = candidates.top();
@@ -889,6 +958,55 @@ class Index {
         break;
       }
       candidates.pop();
+#ifdef FLATNAV_PROFILE_PQ
+      // Residency of the node being expanded = tl_step (its pop step) - its discovery step.
+      // tl_step is NOT incremented until after the expansion, so neighbors discovered below
+      // are tagged with this node's pop step.
+      {
+        auto it = tl_disc.find(node);
+        uint32_t res = tl_step - (it != tl_disc.end() ? it->second : tl_step);
+        g_pq_residency_hist[res < kPQHistCap ? res : kPQHistCap - 1].fetch_add(1, std::memory_order_relaxed);
+        // per-step (pop index) buckets for the early/late split
+        uint32_t sidx = tl_step < kPQStepCap ? tl_step : kPQStepCap - 1;
+        g_step_count[sidx].fetch_add(1, std::memory_order_relaxed);
+        g_step_sumres[sidx].fetch_add(res, std::memory_order_relaxed);
+        if (res == 1) g_step_leap[sidx].fetch_add(1, std::memory_order_relaxed);
+        tl_cur_residency = res;            // neighbors discovered now inherit this as parent residency
+        if (res == 1) {                    // leapfrogger (res 0 = entry node): how much lead did its parent give?
+          auto pit = tl_parent_res.find(node);
+          uint32_t pr = (pit != tl_parent_res.end()) ? pit->second : 0;
+          g_leapfrog_parent_hist[pr < kPQHistCap ? pr : kPQHistCap - 1].fetch_add(1, std::memory_order_relaxed);
+        }
+        // top-K prefetch policy: mark this node as popped (a prefetch "success").
+        { auto& e = tl_pf[node]; e.popped = true; e.pop_step = (uint16_t)tl_step; }
+        // top-K prefetch policy: snapshot the K closest pending candidates NOW -- just after the
+        // pop, before processCandidateNode discovers this node's neighbors -- so this step's
+        // leapfroggers are excluded from every K. Record each node's first-prefetch step. tl_step
+        // is still this step.
+        {
+          PriorityQueue tmp = candidates;  // copy; pop to read closest-first
+          int maxK = kPFK[kPFnumK - 1];
+          for (int r = 1; r <= maxK && !tmp.empty(); ++r) {
+            node_id_t x = tmp.top().second; tmp.pop();
+            auto& e = tl_pf[x];
+            for (int ki = 0; ki < kPFnumK; ++ki)
+              if (r <= kPFK[ki] && e.fe[ki] == 0xFFFF) e.fe[ki] = (uint16_t)tl_step;
+          }
+        }
+        // pre-expansion K=1 NEXT-STEP precision: did last step's prefetched 2nd-min == the node
+        // popped now? (i.e. used at the immediately next step). Then record this step's 2nd-min.
+        if (tl_pf1_valid) {
+          uint32_t b = tl_pf1_step < kPQStepCap ? tl_pf1_step : kPQStepCap - 1;
+          g_pf1_next_total[b].fetch_add(1, std::memory_order_relaxed);
+          if (node == tl_pf1_node) g_pf1_next_hit[b].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!candidates.empty()) {
+          tl_pf1_node = candidates.top().second; tl_pf1_step = tl_step; tl_pf1_valid = true;
+        } else {
+          tl_pf1_valid = false;  // nothing left to prefetch this step
+        }
+      }
+#endif
 
       // Prefetching the next candidate node data and visited set marker
       // before processing it. Note that this might not be useful if the current
@@ -909,8 +1027,31 @@ class Index {
           /* visited_set = */ visited_set,
           /* neighbors = */ neighbors, /* candidates = */ candidates,
           /* query_visited_nodes = */ query_visited_nodes_flags);
-      
+#ifdef FLATNAV_PROFILE_PQ
+      tl_step++;  // advance the step counter after the expansion completes
+#endif
     }
+#ifdef FLATNAV_PROFILE_PQ
+    // Terminal: the 2nd-min prefetched at the final step has no "next step" (search ended) -> miss.
+    if (tl_pf1_valid) {
+      uint32_t b = tl_pf1_step < kPQStepCap ? tl_pf1_step : kPQStepCap - 1;
+      g_pf1_next_total[b].fetch_add(1, std::memory_order_relaxed);
+    }
+    // End of query: tally each prefetched node as success (popped) or waste (never popped),
+    // bucketed by its first-prefetch step, for every K.
+    for (auto& kv : tl_pf) {
+      PFEntry& e = kv.second;
+      for (int ki = 0; ki < kPFnumK; ++ki) {
+        if (e.fe[ki] == 0xFFFF) continue;
+        uint32_t s = e.fe[ki] < kPQStepCap ? e.fe[ki] : kPQStepCap - 1;
+        g_pf_prefetched[ki][s].fetch_add(1, std::memory_order_relaxed);
+        if (e.popped) {
+          g_pf_success[ki][s].fetch_add(1, std::memory_order_relaxed);
+          g_pf_leadsum[ki].fetch_add((uint32_t)(e.pop_step - e.fe[ki]), std::memory_order_relaxed);
+        }
+      }
+    }
+#endif
 
     _visited_set_pool->pushVisitedSet(
         /* visited_set = */ visited_set);
@@ -975,6 +1116,11 @@ class Index {
       if (neighbors.size() < buffer_size || dist < max_dist) {
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
+#ifdef FLATNAV_PROFILE_PQ
+        // Node enters the PQ now (discovered during the current expansion).
+        tl_disc[neighbor_node_id] = tl_step;
+        tl_parent_res[neighbor_node_id] = tl_cur_residency;
+#endif
         // query_visited_nodes_flags.push_back(_hub_nodes[neighbor_node_id]);
 #if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
