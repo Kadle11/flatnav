@@ -102,11 +102,24 @@ Host process (local node)                 Distance server (remote node)
 ## Performance levers for high-bandwidth offload
 
 1. **Per-thread slots** — map `NumaThreadPool` worker id → slot; zero slot contention.
-2. **Batch distances per beam step.** The hot site expands a node's up-to-`M` neighbors
-   ([Index.h:1108](../../include/flatnav/index/Index.h#L1108)). The fork sends **one**
-   node id per request (`num_node_ids = 1`). Sending all `M` in one request amortizes
-   the round-trip — this is the biggest throughput lever. `CxlRequest` already carries
-   `num_node_ids`.
+2. **Batch distances per beam step.** Granularity is per expanded
+   (popped) node: each beam step reads one node's `≤ M` links and
+   computes a distance per neighbor
+   ([Index.h:1085-1108](../../include/flatnav/index/Index.h#L1085-L1108)). The fork sends
+   one id per request (`num_node_ids = 1`); instead send that node's unvisited
+   neighbors as one request.
+
+   Restructure the inner loop into three passes (the batch at most the `M` links —
+   visited neighbors are skipped today at
+   [1098](../../include/flatnav/index/Index.h#L1098)):
+   1. **gather** — walk the `M` links, drop `visited_set->isVisited(...)`, mark unvisited,
+      collect ids into a `≤ M` array;
+   2. **one `computeDistances`** — send the array, get the distances back (`CxlRequest`
+      already carries `num_node_ids`);
+   3. **scatter** — push each `(id, dist)` into the `candidates`/`neighbors` PQs.
+
+   Batch size `≤ M` (32), shrinking as the search progresses and more neighbors are
+   already visited. Entry-node and `initializeSearch` distances stay single (`n = 1`).
 3. **Busy-poll, one thread per core.** Both sides spin. Host threads spin
    for the response, server workers spin on their slot (no yield/sleep). Pin **one
    thread per core**: N host search threads on the local-node cores, S server workers on
