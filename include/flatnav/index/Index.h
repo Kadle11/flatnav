@@ -79,6 +79,27 @@ inline thread_local uint32_t tl_pf1_step;   // the step it was prefetched at
 inline thread_local bool tl_pf1_valid;
 #endif
 
+#ifdef FLATNAV_PQ_GATE
+// Step-windowed PQ traversal (tools/pq_stepgate.cpp). Expansions inside the window
+// [_pq_gate_lo, _pq_gate_hi) score newly-discovered nodes with the ASYMMETRIC PQ distance (a
+// lookup over the node's code -- no vector read); expansions outside it use exact distances.
+// At the window's end the beam and the pending candidates are rescored exact, so the search
+// resumes off a correct beam. Sliding the window isolates WHICH PHASE of the search actually
+// needs exactness; the window [0, N) is the prefix gate that M11 measured. The per-query LUT
+// (_pq_m x 256 floats: query subvector to each subquantizer centroid) is built by the caller
+// and installed here before search(); null LUT = exact distances everywhere.
+inline thread_local const float* tl_pq_lut = nullptr;
+inline thread_local uint32_t tl_gate_step = 0;         // expansions done so far this query
+// Per-query tallies, flushed into the globals once at the end of beamSearch. These count one
+// per DISTANCE (~4k/query, the innermost loop), so they must not be atomics: 32 threads
+// incrementing two adjacent globals would false-share the line through the whole run.
+inline thread_local uint32_t tl_gate_pq = 0;
+inline thread_local uint32_t tl_gate_exact = 0;
+inline std::atomic<uint64_t> g_gate_pq_dists{0};       // distances served from PQ codes
+inline std::atomic<uint64_t> g_gate_exact_dists{0};    // traversal distances that read a full vector
+inline std::atomic<uint64_t> g_gate_rescore_dists{0};  // vector reads spent rescoring PQ-ranked queues
+#endif
+
 // dist_t: A distance function implementing DistanceInterface.
 // label_t: A fixed-width data type for the label (meta-data) of each point.
 template <typename dist_t, typename label_t>
@@ -169,6 +190,16 @@ class Index {
   // entry node (skipping the per-query initialization scan), so all traversals are
   // rooted at one vertex. Set via setFixedEntryNode(); -1 = normal per-query entry.
   int64_t _fixed_entry_node = -1;
+
+#ifdef FLATNAV_PQ_GATE
+  // Step-windowed PQ traversal. _pq_codes is _pq_m bytes per node, indexed by internal node id;
+  // expansions in [_pq_gate_lo, _pq_gate_hi) are scored on PQ. hi <= lo = window empty = gate
+  // off (exact search). Set via setPQGate().
+  const uint8_t* _pq_codes = nullptr;
+  uint32_t _pq_m = 0;
+  int _pq_gate_lo = 0;
+  int _pq_gate_hi = 0;
+#endif
 
   // Randomization parameters
   bool _use_random_initialization = false;
@@ -372,6 +403,18 @@ class Index {
 
   // Design-1 SSSP: fix the common source vertex for all subsequent searches.
   void setFixedEntryNode(int64_t s) { _fixed_entry_node = s; }
+
+#ifdef FLATNAV_PQ_GATE
+  // Step-windowed PQ traversal: score expansions in [lo, hi) on the PQ codes (`m` bytes per
+  // node, node-id indexed), exact outside. The caller must also install a per-query LUT in
+  // flatnav::tl_pq_lut on the searching thread. hi <= lo -> exact search everywhere.
+  void setPQGate(const uint8_t* codes, uint32_t m, int lo, int hi) {
+    _pq_codes = codes;
+    _pq_m = m;
+    _pq_gate_lo = lo;
+    _pq_gate_hi = hi;
+  }
+#endif
 
   // Medoid = node nearest to the dataset mean vector (a principled central source).
   // Two streaming passes over the vectors.
@@ -878,6 +921,66 @@ class Index {
     return reinterpret_cast<node_id_t*>(location);
   }
 
+#ifdef FLATNAV_PQ_GATE
+  // Asymmetric PQ distance: sum over subquantizers of the query-to-centroid distance picked
+  // out by this node's code byte. Touches the m-byte code only -- never the full vector.
+  float pqDistance(const node_id_t& n) const {
+    const uint8_t* code = _pq_codes + static_cast<uint64_t>(n) * static_cast<uint64_t>(_pq_m);
+    float d = 0.0f;
+    for (uint32_t m = 0; m < _pq_m; m++) {
+      d += tl_pq_lut[(m << 8) + code[m]];
+    }
+    return d;
+  }
+
+  // End of the PQ phase: replace every PQ score in the beam with the exact distance (one
+  // vector read each). A priority_queue has no in-place key update, so it is drained and
+  // rebuilt. The beam stores +distance, so its max-heap top is the furthest member. When a
+  // candidate pass follows (the gate-step switch) pass a `cache` to record the distances --
+  // a node usually sits in both queues, and g_gate_rescore_dists must count DISTINCT vector
+  // reads. Pass nullptr when nothing follows, so no map is built.
+  void rescoreBeamExact(const void* query, PriorityQueue& beam,
+                        std::unordered_map<node_id_t, float>* cache) {
+    PriorityQueue rescored;
+    uint64_t reads = 0;
+    while (!beam.empty()) {
+      node_id_t n = beam.top().second;
+      beam.pop();
+      float d = _distance->distance(/* x = */ query, /* y = */ getNodeData(n),
+                                    /* asymmetric = */ true);
+      if (cache) (*cache)[n] = d;
+      rescored.emplace(d, n);
+      reads++;
+    }
+    beam = std::move(rescored);
+    g_gate_rescore_dists.fetch_add(reads, std::memory_order_relaxed);
+  }
+
+  // Same, for the candidate queue -- which stores NEGATED distances so its top is the nearest
+  // pending node. Nodes already rescored with the beam are reused from `cache` (no vector read).
+  void rescoreCandidatesExact(const void* query, PriorityQueue& candidates,
+                              const std::unordered_map<node_id_t, float>& cache) {
+    PriorityQueue rescored;
+    uint64_t reads = 0;
+    while (!candidates.empty()) {
+      node_id_t n = candidates.top().second;
+      candidates.pop();
+      auto it = cache.find(n);
+      float d;
+      if (it != cache.end()) {
+        d = it->second;
+      } else {
+        d = _distance->distance(/* x = */ query, /* y = */ getNodeData(n),
+                                /* asymmetric = */ true);
+        reads++;
+      }
+      rescored.emplace(-d, n);
+    }
+    candidates = std::move(rescored);
+    g_gate_rescore_dists.fetch_add(reads, std::memory_order_relaxed);
+  }
+#endif
+
   label_t* getNodeLabel(const node_id_t& n) const {
     uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_graph_node_size_bytes);
     byte_offset += (_M * sizeof(node_id_t));
@@ -933,8 +1036,18 @@ class Index {
     _mm_prefetch(getNodeData(entry_node), _MM_HINT_T0);
 #endif
 
-    float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
-                                     /* asymmetric = */ true);
+    float dist;
+#ifdef FLATNAV_PQ_GATE
+    tl_gate_step = 0;
+    tl_gate_pq = 0;
+    tl_gate_exact = 0;
+    if (tl_pq_lut && _pq_gate_hi > 0 && _pq_gate_lo == 0) {
+      dist = pqDistance(entry_node);  // step 0 is inside the window
+      tl_gate_pq++;
+    } else
+#endif
+      dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
+                                 /* asymmetric = */ true);
 #ifdef FLATNAV_PROFILE_VISITS
     if (_node_data_counts) _node_data_counts[entry_node].fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -952,6 +1065,18 @@ class Index {
 #endif
 
     while (!candidates.empty()) {
+#ifdef FLATNAV_PQ_GATE
+      // The window ends at this expansion: rescore the beam + pending candidates with exact
+      // distances, so the search resumes off a correct beam. Nodes scored exactly before the
+      // window are re-read too (idempotent, deliberately not tracked). Fires at most once per
+      // query, before this step reads candidates.top().
+      if (tl_pq_lut && _pq_gate_hi > _pq_gate_lo && tl_gate_step == (uint32_t)_pq_gate_hi) {
+        std::unordered_map<node_id_t, float> exact_cache;
+        rescoreBeamExact(query, neighbors, &exact_cache);
+        rescoreCandidatesExact(query, candidates, exact_cache);
+        max_dist = neighbors.top().first;
+      }
+#endif
       auto [distance, node] = candidates.top();
 
       if (-distance > max_dist && neighbors.size() >= buffer_size) {
@@ -1030,6 +1155,9 @@ class Index {
 #ifdef FLATNAV_PROFILE_PQ
       tl_step++;  // advance the step counter after the expansion completes
 #endif
+#ifdef FLATNAV_PQ_GATE
+      tl_gate_step++;
+#endif
     }
 #ifdef FLATNAV_PROFILE_PQ
     // Terminal: the 2nd-min prefetched at the final step has no "next step" (search ended) -> miss.
@@ -1051,6 +1179,19 @@ class Index {
         }
       }
     }
+#endif
+
+#ifdef FLATNAV_PQ_GATE
+    // The search ended inside the window (it never closed), so the beam may still hold PQ
+    // scores -- rescore it so the returned top-K is ordered by exact distance. Skipped when
+    // the search ended before ever reaching `lo`, since then nothing was scored on PQ.
+    if (tl_pq_lut && _pq_gate_hi > _pq_gate_lo && tl_gate_step > (uint32_t)_pq_gate_lo &&
+        tl_gate_step <= (uint32_t)_pq_gate_hi) {
+      rescoreBeamExact(query, neighbors, /* cache = */ nullptr);  // nothing follows
+    }
+    // One pair of atomics per query instead of one per distance.
+    g_gate_pq_dists.fetch_add(tl_gate_pq, std::memory_order_relaxed);
+    g_gate_exact_dists.fetch_add(tl_gate_exact, std::memory_order_relaxed);
 #endif
 
     _visited_set_pool->pushVisitedSet(
@@ -1082,6 +1223,13 @@ class Index {
     if (_node_visit_counts) _node_visit_counts[node].fetch_add(1, std::memory_order_relaxed);
 #endif
     query_visited_nodes_flags.push_back(_hub_nodes[node]);
+#ifdef FLATNAV_PQ_GATE
+    // Invariant for this whole expansion -- tl_gate_step only advances in beamSearch's loop --
+    // so it is computed once here rather than per neighbor. An empty window (hi <= lo) can
+    // never satisfy both bounds, so it needs no separate off switch.
+    const bool use_pq = tl_pq_lut && tl_gate_step >= (uint32_t)_pq_gate_lo &&
+                        tl_gate_step < (uint32_t)_pq_gate_hi;
+#endif
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
 
@@ -1105,9 +1253,16 @@ class Index {
       // a superset of link-expanded nodes (these neighbors may never be expanded).
       if (_node_data_counts) _node_data_counts[neighbor_node_id].fetch_add(1, std::memory_order_relaxed);
 #endif
-      float dist = _distance->distance(/* x = */ query,
-                                 /* y = */ getNodeData(neighbor_node_id),
-                                 /* asymmetric = */ true);
+      float dist;
+#ifdef FLATNAV_PQ_GATE
+      // Inside the PQ phase this neighbor is scored from its code -- no vector read at all.
+      (use_pq ? tl_gate_pq : tl_gate_exact)++;
+      if (use_pq)
+        dist = pqDistance(neighbor_node_id);
+      else
+#endif
+        dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(neighbor_node_id),
+                                   /* asymmetric = */ true);
 
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
