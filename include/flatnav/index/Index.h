@@ -100,6 +100,28 @@ inline std::atomic<uint64_t> g_gate_exact_dists{0};    // traversal distances th
 inline std::atomic<uint64_t> g_gate_rescore_dists{0};  // vector reads spent rescoring PQ-ranked queues
 #endif
 
+#ifdef FLATNAV_SPEC_TRACE
+// Speculation-divergence trace (tools/pq_specdiverge.cpp): starting from the exact search's own
+// beam at the window's lower edge, does a PQ scout make the same decisions the exact search
+// does INSIDE the window [lo,hi)? The PQ approximation begins at step lo -- the search is exact
+// for steps [0,lo), so the exact baseline and the gated run share an identical prefix and
+// diverge only within the window; the divergence measured over [lo,hi) is purely the effect of
+// PQ speculation in that phase, from a correct starting beam. Two captures, both keyed by
+// expansion step (== tl_gate_step, the beam-loop expansion index):
+//   tl_spec_expand -- the ordered list of expanded node ids. Filled on the exact baseline AND
+//     each gated run; the tool Jaccard-compares the two trajectories' node SETS over [lo,hi)
+//     (scout drift; decision unit = expanded-node set).
+//   tl_spec_disc   -- {step, exact, pq} per newly-discovered neighbor, filled on the gated run
+//     inside the window: pq is the distance that DROVE the scout, exact is computed alongside
+//     (a measurement-only vector read) so the tool can score whether the scout ranked the
+//     discovered set the way exact would (fetch-target agreement; counterfactual per expansion).
+// The caller installs the target vectors on its thread before each search and reads them after;
+// a null pointer disables that capture.
+struct SpecDisc { uint32_t step; float exact; float pq; };
+inline thread_local std::vector<uint32_t>* tl_spec_expand = nullptr;
+inline thread_local std::vector<SpecDisc>* tl_spec_disc = nullptr;
+#endif
+
 // dist_t: A distance function implementing DistanceInterface.
 // label_t: A fixed-width data type for the label (meta-data) of each point.
 template <typename dist_t, typename label_t>
@@ -1146,6 +1168,11 @@ class Index {
       }
 #endif
 
+#ifdef FLATNAV_SPEC_TRACE
+      // This node is being expanded now, at step tl_gate_step. Record the trajectory (this fires
+      // after the early-break check, so only truly-expanded nodes are logged).
+      if (tl_spec_expand) tl_spec_expand->push_back(node);
+#endif
       processCandidateNode<is_search_stage>(
           /* query = */ query, /* node = */ node,
           /* max_dist = */ max_dist, /* buffer_size = */ buffer_size,
@@ -1263,6 +1290,17 @@ class Index {
 #endif
         dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(neighbor_node_id),
                                    /* asymmetric = */ true);
+#ifdef FLATNAV_SPEC_TRACE
+      // Gated run, inside the PQ window (use_pq): `dist` is the PQ score that drove the scout to
+      // rank this neighbor; compute the exact distance alongside (measurement only -- this read
+      // does not exist in a real scout) so the tool can compare the scout's ranking to exact's.
+      if (use_pq && tl_spec_disc)
+        tl_spec_disc->push_back({tl_gate_step,
+                                 _distance->distance(/* x = */ query,
+                                                     /* y = */ getNodeData(neighbor_node_id),
+                                                     /* asymmetric = */ true),
+                                 dist});
+#endif
 
       if (_collect_stats) {
         _distance_computations.fetch_add(1);

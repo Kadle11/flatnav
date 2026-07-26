@@ -681,3 +681,67 @@ the SAME phase (early discovery) where the whole beam is still in flux. The trig
 per-node (Part 2 quality gate). Instrumentation: `FLATNAV_PQ_GATE` window in Index.h +
 `tools/pq_stepgate.cpp` (WINDOWS=lo:hi,...) + `scripts/pq_stepgate.sh`; raw
 `~/pq_window_w30/sweep.log` on clnode222.
+
+## 2026-07-24 — Milestone 13: PQ speculation divergence — does a scout walk the exact path? (widths 30/60)
+
+M12 asked "which phase needs exactness" by measuring END-TO-END RECALL of a PQ-gated search.
+M13 asks the prior question for design direction #1/#3 ("Speculate with PQ, verify with PF" /
+"PQ scout manufactures the lead PF lacks early"): if we launch a PQ scout from the exact search's
+OWN beam at a window's lower edge, does it make the same decisions the exact search does INSIDE
+the window? New instrumentation `FLATNAV_SPEC_TRACE` in Index.h + `tools/pq_specdiverge.cpp` +
+`scripts/pq_specdiverge.sh`. The search is exact for steps [0,lo) and PQ inside [lo,hi) (reuses
+the M12 gate), so the exact baseline and the gated run share an identical prefix and diverge only
+within the window — the divergence is purely the effect of PQ speculation in that phase, from a
+correct starting beam. Two decision units, per sliding window (same config: SIFT100M, ef=200,
+K=100, 200k q, m=16/8bit):
+- **drift** = Jaccard of the gated vs exact EXPANDED-NODE sets over [lo,hi) ("does the scout walk
+  the same nodes?"). 1.0 = identical walk.
+- **fetch** = at each in-window expansion, PQ-vs-exact ranking of that expansion's discovered
+  neighbors: `kendall` (tau-a, local order), `top1` (nearest agrees), `pool_ov@32` (over the whole
+  window's discovered set, overlap of the 32 nearest by PQ vs by exact — the fetch-target set).
+
+| window [lo,hi) | drift_jaccard | kendall | top1 | pool_ov@32 | support |
+|---|---|---|---|---|---|
+| w30 0:30    | **0.258** | 0.693 | 0.565 | 0.623 | 100% |
+| w30 30:60   | 0.486 | 0.675 | 0.535 | 0.579 | 100% |
+| w30 60:90   | 0.567 | 0.669 | 0.529 | 0.568 | 100% |
+| w30 90:120  | 0.606 | 0.665 | 0.526 | 0.563 | 100% |
+| w30 120:150 | 0.630 | 0.662 | 0.525 | 0.560 | 100% |
+| w30 150:180 | 0.647 | 0.660 | 0.524 | 0.558 | 100% |
+| w30 180:210 | 0.654 | 0.658 | 0.524 | 0.571 | 100% |
+| w30 210:240 | 0.709 | 0.660 | 0.507 | 0.830 | 8% (small-sample) |
+| w60 0:60    | **0.323** | 0.684 | 0.551 | 0.568 | 100% |
+| w60 60:120  | 0.554 | 0.667 | 0.528 | 0.507 | 100% |
+| w60 120:180 | 0.620 | 0.661 | 0.525 | 0.495 | 100% |
+| w60 180:240 | 0.651 | 0.658 | 0.524 | 0.569 | 100% |
+
+Findings:
+- **Divergence is a TRAJECTORY problem, not a ranking problem.** From a correct exact beam, a PQ
+  scout's next 30 expansions overlap exact's by only **26%** ([0,30) drift 0.258); its next 60 by
+  **32%**. Yet its per-expansion LOCAL ranking is decent and roughly flat everywhere (kendall
+  ~0.66–0.69, top1 ~0.52–0.57) — and even slightly BETTER early. So PQ does not misrank a given
+  discovered set badly; the problem is that small early mis-picks (top1 0.565 = PQ chooses a
+  different nearest neighbor 44% of the time) compound into a different basin within tens of steps.
+- **Drift is worst exactly where M12 said exactness matters** (early descent) and recovers
+  monotonically with depth (0.26 → 0.65 by step ~180). The two experiments cross-check: early is
+  where true neighbors are discovered (M10) AND where a scout wanders off the exact path.
+- **Strike against the free-running early scout (design #3).** #3 wanted PQ to leap AHEAD of the
+  exact search early to manufacture prefetch lead. But 74% of the scout's early expansions are
+  nodes exact never touches, so the exact-fetch targets it would emit are for a path exact will
+  not take — the manufactured lead points the wrong way. PQ scouting adds least value early, the
+  same place PF lacks lead; and where drift finally plateaus (~180) PF already has its own lead.
+- **Supports PQ as a per-node RANKER, not a pathfinder** (design #1 quality gate). kendall ~0.69
+  means PQ can reasonably order candidates it has ALREADY discovered exactly — fine for choosing
+  which of the current beam's members deserve an exact fetch. It cannot be trusted to GENERATE the
+  candidate set by running ahead. Keep PQ ranking a discovered set; keep discovery exact.
+- Caveats: pool_ov@32 is a fraction of a window-sized pool, so it dips mid-search (w60 [60,180)
+  ~0.50) where the pool is largest and recovers when the pool shrinks — not comparable across
+  widths. The w30 [210,240) row (pool_ov 0.830, 8% support) and other tail spikes are
+  small-set/small-sample artifacts; the early [0,30)/[0,60) rows at 100% support carry the result.
+
+Consequence: PQ is trustworthy as the SELECTION layer (rank an already-discovered candidate set)
+but not as an early SCOUT that runs ahead to produce candidates — divergence compounds too fast in
+the early discovery phase. Reinforces M11/M12 (per-node gate, no phase rule) and narrows design #3.
+Instrumentation: `FLATNAV_SPEC_TRACE` in Index.h + `tools/pq_specdiverge.cpp` +
+`scripts/pq_specdiverge.sh`; binary `~/pq_specdiverge_bench`, raw
+`~/pq_specdiverge_full/sweep.log` on clnode222.
