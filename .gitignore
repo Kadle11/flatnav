@@ -33,3 +33,9 @@ external/openmp
 wheelhouse
 
 hnswlib-original/
+
+# Logs
+*.log
+*.csv
+*.png
+*.pdf
