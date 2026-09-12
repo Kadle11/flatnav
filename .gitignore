@@ -39,3 +39,6 @@ hnswlib-original/
 *.csv
 *.png
 *.pdf
+
+# Datasets
+*.zst
