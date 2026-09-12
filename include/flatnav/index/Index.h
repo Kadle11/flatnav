@@ -7,6 +7,7 @@
 #include <flatnav/util/VisitedSetPool.h>
 #include <flatnav/util/Datatype.h>
 #include <flatnav/util/NumaAllocation.h>
+#include <flatnav/util/PrefetchStaging.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -28,6 +29,7 @@
 #include <utility>
 #include <vector>
 #include <optional>
+#include <x86intrin.h>  // __rdtsc for FLATNAV_PROFILE_PHASE timing
 
 using flatnav::distances::DistanceInterface;
 using flatnav::util::VisitedSet;
@@ -49,6 +51,7 @@ inline constexpr int kPQStepCap = 1024;
 inline std::atomic<uint64_t> g_step_count[kPQStepCap];   // # expansions at this step
 inline std::atomic<uint64_t> g_step_leap[kPQStepCap];    // of those, residency==1 (leapfroggers)
 inline std::atomic<uint64_t> g_step_sumres[kPQStepCap];  // sum of residency (for mean)
+inline std::atomic<uint64_t> g_step_fanout[kPQStepCap];  // # NEW (unvisited) neighbors fetched/dist-computed at this step
 inline thread_local std::unordered_map<uint32_t, uint32_t> tl_disc;        // node -> discovery step
 inline thread_local std::unordered_map<uint32_t, uint32_t> tl_parent_res;  // node -> parent's residency
 inline thread_local uint32_t tl_step;          // pops done so far this query
@@ -77,6 +80,20 @@ inline std::atomic<uint64_t> g_pf1_next_hit[kPQStepCap];
 inline thread_local uint32_t tl_pf1_node;   // 2nd-min prefetched last step
 inline thread_local uint32_t tl_pf1_step;   // the step it was prefetched at
 inline thread_local bool tl_pf1_valid;
+
+#ifdef FLATNAV_PROFILE_TOPK
+// tools/topk_found.cpp: at which step was each final top-K result first DISCOVERED
+// (distance-computed)? Reads tl_disc. g_topk_found = histogram of discovery steps over all
+// (query x top-K) results; g_topk_complete = per-query step of the LAST top-K discovery
+// (= "answer complete"); g_topk_rank1 = discovery step of the 1-NN. Needs FLATNAV_PROFILE_PQ.
+inline int g_topk_K = 100;
+inline std::atomic<uint64_t> g_topk_found[kPQStepCap];
+inline std::atomic<uint64_t> g_topk_complete[kPQStepCap];
+inline std::atomic<uint64_t> g_topk_rank1[kPQStepCap];
+inline std::atomic<uint64_t> g_topk_complete_sum;  // sum over queries of the answer-complete step
+inline std::atomic<uint64_t> g_topk_total_sum;     // sum over queries of total steps
+inline std::atomic<uint64_t> g_topk_nq;            // #queries counted
+#endif
 #endif
 
 #ifdef FLATNAV_PQ_GATE
@@ -111,16 +128,42 @@ inline std::atomic<uint64_t> g_gate_rescore_dists{0};  // vector reads spent res
 //   tl_spec_expand -- the ordered list of expanded node ids. Filled on the exact baseline AND
 //     each gated run; the tool Jaccard-compares the two trajectories' node SETS over [lo,hi)
 //     (scout drift; decision unit = expanded-node set).
-//   tl_spec_disc   -- {step, exact, pq} per newly-discovered neighbor, filled on the gated run
-//     inside the window: pq is the distance that DROVE the scout, exact is computed alongside
-//     (a measurement-only vector read) so the tool can score whether the scout ranked the
-//     discovered set the way exact would (fetch-target agreement; counterfactual per expansion).
+//   tl_spec_disc   -- {step, node, exact, pq, thresh} per newly-discovered neighbor. Whichever
+//     of exact/pq did NOT drive this expansion is computed alongside as a measurement (a vector
+//     read inside the PQ window, a code lookup outside it), so the tool can score whether PQ
+//     ranked the discovered set the way exact would (fetch-target agreement; counterfactual per
+//     expansion). Filled inside the PQ window on a gated run AND on every expansion of an exact
+//     run that has a LUT installed -- the latter is M14's per-vector error along the EXACT
+//     trajectory, whose step axis is comparable to M8/M10/M12 and whose touched population is
+//     not self-selected by PQ's own mistakes.
+//     `node` attributes the error to a vector; `thresh` is the beam's K-th best at the moment of
+//     the decision (+inf while the beam is still filling), so the tool can separate a harmless
+//     error from one that flips this node's admission: (exact < thresh) != (pq < thresh).
 // The caller installs the target vectors on its thread before each search and reads them after;
 // a null pointer disables that capture.
-struct SpecDisc { uint32_t step; float exact; float pq; };
+struct SpecDisc { uint32_t step; uint32_t node; float exact; float pq; float thresh; };
 inline thread_local std::vector<uint32_t>* tl_spec_expand = nullptr;
 inline thread_local std::vector<SpecDisc>* tl_spec_disc = nullptr;
 #endif
+
+// Terminal-basin trajectory capture (tools/basin_map.cpp), gated by FLATNAV_PROFILE_TRAJ
+// at the use sites. Declared unconditionally (thread_locals, zero cost when unused) so
+// the tool can read them without pulling in the FLATNAV_PROFILE_PQ residency machinery.
+inline thread_local std::vector<uint32_t> tl_traj;   // expanded node ids, in pop order
+inline thread_local uint32_t tl_term_node;           // closest node found so far (internal id)
+inline thread_local float tl_term_dist;              // its distance
+
+// Per-search-depth timing (tools/phase_time.cpp): FIXED-WIDTH bins of kBinW=30 expansions
+// (bin b = expansion steps [30b, 30b+30)). Accumulate rdtsc cycles per ABSOLUTE bin, so the
+// number of populated bins is set by each query's search length (longer searches reach more
+// bins). One rdtsc + a couple of atomics per expansion -> negligible vs an ~11 us step.
+inline constexpr int kBinW = 30;
+inline constexpr int kBins = 64;                     // covers searches up to 1920 expansions
+inline std::atomic<uint64_t> g_bin_cycles[kBins];    // total rdtsc cycles attributed to bin b
+inline std::atomic<uint64_t> g_bin_steps[kBins];     // # expansions in bin b
+inline std::atomic<uint64_t> g_bin_queries[kBins];   // # queries that reached bin b
+inline thread_local uint32_t tl_pstep;               // expansion index within the current query
+inline thread_local uint64_t tl_bin_ts;              // rdtsc taken at the current bin's start boundary
 
 // dist_t: A distance function implementing DistanceInterface.
 // label_t: A fixed-width data type for the label (meta-data) of each point.
@@ -142,6 +185,19 @@ class Index {
   };
 
   typedef std::priority_queue<dist_node_t, std::vector<dist_node_t>, CompareByFirst> PriorityQueue;
+
+  // Read-only access to a PriorityQueue's underlying heap array (to cheaply read the top-K
+  // pending candidates without copying/popping). Index 0 = root = closest; the rest is heap
+  // order, so the first K entries approximate the K closest -- good enough for a prefetch
+  // hint. Uses the standard protected-member-access idiom.
+  static const std::vector<dist_node_t>& pqHeap(const PriorityQueue& pq) {
+    struct Hack : private PriorityQueue {
+      static const std::vector<dist_node_t>& get(const PriorityQueue& p) {
+        return p.*&Hack::c;
+      }
+    };
+    return Hack::get(pq);
+  }
 
   // NUMA-aware storage. The data and the graph are kept in two separate,
   // contiguous (structure-of-arrays) allocations so each can be bound to its
@@ -213,6 +269,12 @@ class Index {
   // rooted at one vertex. Set via setFixedEntryNode(); -1 = normal per-query entry.
   int64_t _fixed_entry_node = -1;
 
+  // Helper-thread vector staging (PrefetchStaging.h): shared local-DRAM buffer + request
+  // ring + top-K knob. Null/0 = off. Set via setPrefetchStaging().
+  StagingBuffer* _pf_buf = nullptr;
+  MPMCRing* _pf_ring = nullptr;
+  int _pf_k = 0;
+
 #ifdef FLATNAV_PQ_GATE
   // Step-windowed PQ traversal. _pq_codes is _pq_m bytes per node, indexed by internal node id;
   // expansions in [_pq_gate_lo, _pq_gate_hi) are scored on PQ. hi <= lo = window empty = gate
@@ -221,6 +283,15 @@ class Index {
   uint32_t _pq_m = 0;
   int _pq_gate_lo = 0;
   int _pq_gate_hi = 0;
+  // Optional per-vector residual norm ||x - c(x)||^2, node-id indexed: the static part of each
+  // vector's PQ error, added back by pqDistance(). Null = uncorrected PQ. Set via setPQResidual().
+  const float* _pq_resid = nullptr;
+  // M15 quality gate: fetch the exact vector for a PQ-scored neighbor whose score lands within
+  // _pq_margin (relative) of the beam's K-th best. 0 = off (pure PQ). _pq_margin_band selects the
+  // shape: one-sided (verify everything PQ would admit, plus the band above the threshold) or a
+  // two-sided band (skip nodes PQ places safely inside). Set via setPQMargin().
+  float _pq_margin = 0.0f;
+  bool _pq_margin_band = false;
 #endif
 
   // Randomization parameters
@@ -436,7 +507,49 @@ class Index {
     _pq_gate_lo = lo;
     _pq_gate_hi = hi;
   }
+
+  // Install (or clear, with nullptr) the per-vector residual-norm correction used by
+  // pqDistance(). `resid[n] = ||x_n - c(x_n)||^2`, node-id indexed.
+  void setPQResidual(const float* resid) { _pq_resid = resid; }
+
+  // M15 quality gate. `margin` is relative to the beam's K-th best (0.1 = within 10%); 0 disables
+  // it. `band` = two-sided (only near-ties are verified) vs one-sided (everything at or below the
+  // threshold is verified too).
+  void setPQMargin(float margin, bool band) { _pq_margin = margin; _pq_margin_band = band; }
 #endif
+
+  // Helper-thread vector staging (PrefetchStaging.h). When configured, each pop enqueues
+  // the top-K pending candidate ids into `ring`; helper threads dequeue them and call
+  // stageNeighbors() to copy the candidate's neighbors' vectors remote->`buf`; the search
+  // reads staged copies (local) when available. All hints -- results unchanged.
+  void setPrefetchStaging(StagingBuffer* buf, MPMCRing* ring, int k) {
+    _pf_buf = buf;
+    _pf_ring = ring;
+    _pf_k = k;
+  }
+
+  // Helper thread: copy the vectors of `candidate`'s neighbors into the staging buffer.
+  void stageNeighbors(uint32_t candidate) {
+    if (!_pf_buf) return;
+    node_id_t* links = getNodeLinks(candidate);
+    for (uint32_t j = 0; j < _M; j++) {
+      node_id_t nbr = links[j];
+      _pf_buf->put(nbr, getNodeData(nbr));
+    }
+  }
+
+  // Ablation: read `candidate`'s neighbors' vectors but discard them (no buffer write).
+  // Injects the helper remote-read traffic without the buffer/coherence, isolating
+  // shared remote-path contention from the buffer-coherence term.
+  void touchNeighbors(uint32_t candidate) {
+    node_id_t* links = getNodeLinks(candidate);
+    volatile char sink = 0;
+    for (uint32_t j = 0; j < _M; j++) {
+      const char* v = getNodeData(links[j]);
+      for (size_t off = 0; off < _data_size_bytes; off += 64) sink ^= v[off];
+    }
+    (void)sink;
+  }
 
   // Medoid = node nearest to the dataset mean vector (a principled central source).
   // Two streaming passes over the vectors.
@@ -900,6 +1013,10 @@ class Index {
   inline char* graphMemory() const { return _graph_memory; }
   inline size_t graphNodeSizeBytes() const { return _graph_node_size_bytes; }
 
+  // Internal node id -> dataset label. Tools that trace internal ids (FLATNAV_SPEC_TRACE) need
+  // this to line a traced node up with a ground-truth file, which is keyed by label.
+  inline label_t nodeLabel(const node_id_t& n) const { return *getNodeLabel(n); }
+
   inline uint64_t distanceComputations() const { return _distance_computations.load(); }
 
   inline DataType getDataType() const { return _data_type; }
@@ -946,13 +1063,20 @@ class Index {
 #ifdef FLATNAV_PQ_GATE
   // Asymmetric PQ distance: sum over subquantizers of the query-to-centroid distance picked
   // out by this node's code byte. Touches the m-byte code only -- never the full vector.
+  //
+  // With x = c + r (reconstruction + residual), the exact distance expands as
+  //     ||q-x||^2 = ||q-c||^2 - 2(q-c).r + ||r||^2,
+  // i.e. this sum is short of the truth by ||r||^2 (a per-vector constant -- PQ systematically
+  // UNDERestimates) plus a zero-mean query-dependent cross term. When _pq_resid is installed
+  // (M14) the per-vector bias is added back, leaving only the cross term; the correction is one
+  // local float per vector and does not read the vector either.
   float pqDistance(const node_id_t& n) const {
     const uint8_t* code = _pq_codes + static_cast<uint64_t>(n) * static_cast<uint64_t>(_pq_m);
     float d = 0.0f;
     for (uint32_t m = 0; m < _pq_m; m++) {
       d += tl_pq_lut[(m << 8) + code[m]];
     }
-    return d;
+    return _pq_resid ? d + _pq_resid[n] : d;
   }
 
   // End of the PQ phase: replace every PQ score in the beam with the exact distance (one
@@ -1085,6 +1209,13 @@ class Index {
     tl_pf.clear();
     tl_pf1_valid = false;
 #endif
+#ifdef FLATNAV_PROFILE_TRAJ
+    tl_traj.clear();
+    tl_term_node = entry_node; tl_term_dist = dist;  // entry is the initial closest
+#endif
+#ifdef FLATNAV_PROFILE_PHASE
+    tl_pstep = 0; tl_bin_ts = 0;
+#endif
 
     while (!candidates.empty()) {
 #ifdef FLATNAV_PQ_GATE
@@ -1105,6 +1236,22 @@ class Index {
         break;
       }
       candidates.pop();
+#ifdef FLATNAV_PROFILE_PHASE
+      // Timestamp ONLY at 30-step bin boundaries: one rdtsc per bin, not per step. The delta
+      // between consecutive boundaries is the wall time of that 30-expansion block.
+      if (tl_pstep % kBinW == 0) {
+        uint64_t now = __rdtsc();
+        if (tl_bin_ts) {  // close out the bin that just finished (its full 30 steps)
+          uint32_t pb = (tl_pstep / kBinW) - 1; if (pb >= (uint32_t)kBins) pb = kBins - 1;
+          g_bin_cycles[pb].fetch_add(now - tl_bin_ts, std::memory_order_relaxed);
+          g_bin_steps[pb].fetch_add(kBinW, std::memory_order_relaxed);
+        }
+        tl_bin_ts = now;
+        uint32_t cb = tl_pstep / kBinW; if (cb >= (uint32_t)kBins) cb = kBins - 1;
+        g_bin_queries[cb].fetch_add(1, std::memory_order_relaxed);  // this query reached bin cb
+      }
+      tl_pstep++;
+#endif
 #ifdef FLATNAV_PROFILE_PQ
       // Residency of the node being expanded = tl_step (its pop step) - its discovery step.
       // tl_step is NOT incremented until after the expansion, so neighbors discovered below
@@ -1168,6 +1315,52 @@ class Index {
       }
 #endif
 
+      // Experiment A (depth-0 tier prefetch): the next-best candidate is expanded
+      // next iteration; its expansion reads its LINKS (the remote pointer-chase),
+      // which is NOT covered by the getNodeData/vector prefetch above. Start that
+      // fetch now so it overlaps the current node's expansion. The link block spans
+      // _graph_node_size_bytes (~3 lines), so prefetch every cache line of it.
+      // T1 (L2, skip L1): the links are used a full expansion later, so filling
+      // L1 risks eviction by this expansion's ~16KB of neighbor vectors before use;
+      // L2 residency still hides the remote/UPI latency with less L1 pollution.
+      //
+      // Guarded ONLY by FLATNAV_PF_LINKS -- deliberately independent of
+      // FLATNAV_DISABLE_PREFETCH -- so this prefetch can be measured in isolation
+      // (existing prefetches off, ours on) without the two mechanisms confounding.
+#if defined(USE_SSE) && defined(FLATNAV_PF_LINKS)
+      if (!candidates.empty()) {
+        const char* links_base =
+            reinterpret_cast<const char*>(getNodeLinks(candidates.top().second));
+        for (size_t off = 0; off < _graph_node_size_bytes; off += 64)
+          _mm_prefetch(links_base + off, _MM_HINT_T1);
+      }
+#endif
+
+      // Helper-thread staging: enqueue the top-K pending candidates so the helper pool
+      // stages their neighbors' vectors into the local buffer ahead of expansion. Lossy
+      // (a full ring just drops the request -> remote read). Runtime-gated; no macro.
+      if (_pf_ring && _pf_k > 0) {
+        const std::vector<dist_node_t>& heap = pqHeap(candidates);
+        int kk = std::min((int)heap.size(), _pf_k);
+        for (int r = 0; r < kk; r++) _pf_ring->enqueue(heap[r].second);
+      }
+
+      // Exp B-ahead (vector prefetch, depth-1): the next-best candidate is expanded next
+      // iteration; prefetch ITS neighbors' vectors now -> one full expansion of lead, and
+      // covers leapfroggers (a leapfrogger is an out-neighbor of a candidate). Requires
+      // READING next's links (a real load) to get the neighbor ids, then prefetching each
+      // neighbor's full vector. Independent of FLATNAV_DISABLE_PREFETCH for isolation.
+#if defined(USE_SSE) && defined(FLATNAV_PF_VEC_AHEAD)
+      if (!candidates.empty()) {
+        node_id_t* nxt_links = getNodeLinks(candidates.top().second);
+        for (uint32_t j = 0; j < _M; j++) {
+          node_id_t nid = nxt_links[j];
+          if (!visited_set->isVisited(nid))
+            _mm_prefetch(getNodeData(nid), _MM_HINT_T0);  // 1 line, skip visited (lightweight)
+        }
+      }
+#endif
+
 #ifdef FLATNAV_SPEC_TRACE
       // This node is being expanded now, at step tl_gate_step. Record the trajectory (this fires
       // after the early-break check, so only truly-expanded nodes are logged).
@@ -1186,6 +1379,14 @@ class Index {
       tl_gate_step++;
 #endif
     }
+#ifdef FLATNAV_PROFILE_PHASE
+    // Close the final (possibly partial) bin: from its start boundary to now.
+    if (tl_bin_ts) {
+      uint32_t lb = (tl_pstep - 1) / kBinW; if (lb >= (uint32_t)kBins) lb = kBins - 1;
+      g_bin_cycles[lb].fetch_add(__rdtsc() - tl_bin_ts, std::memory_order_relaxed);
+      g_bin_steps[lb].fetch_add(tl_pstep - lb * kBinW, std::memory_order_relaxed);  // steps in the last bin
+    }
+#endif
 #ifdef FLATNAV_PROFILE_PQ
     // Terminal: the 2nd-min prefetched at the final step has no "next step" (search ended) -> miss.
     if (tl_pf1_valid) {
@@ -1205,6 +1406,30 @@ class Index {
           g_pf_leadsum[ki].fetch_add((uint32_t)(e.pop_step - e.fe[ki]), std::memory_order_relaxed);
         }
       }
+    }
+#endif
+#ifdef FLATNAV_PROFILE_TOPK
+    // `neighbors` holds the final beam (buffer_size elements). The top-K = the K smallest by
+    // distance; record the discovery step (tl_disc) of each, and the last one (answer-complete).
+    {
+      std::vector<std::pair<float, node_id_t>> beam;
+      beam.reserve(neighbors.size());
+      { PriorityQueue nb = neighbors; while (!nb.empty()) { beam.push_back(nb.top()); nb.pop(); } }
+      std::sort(beam.begin(), beam.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+      size_t topk = std::min((size_t)g_topk_K, beam.size());
+      uint32_t maxdisc = 0;
+      for (size_t r = 0; r < topk; r++) {
+        auto it = tl_disc.find(beam[r].second);
+        uint32_t ds = (it != tl_disc.end()) ? it->second : 0;
+        uint32_t sb = ds < (uint32_t)kPQStepCap ? ds : kPQStepCap - 1;
+        g_topk_found[sb].fetch_add(1, std::memory_order_relaxed);
+        if (r == 0) g_topk_rank1[sb].fetch_add(1, std::memory_order_relaxed);
+        if (ds > maxdisc) maxdisc = ds;
+      }
+      g_topk_complete[maxdisc < (uint32_t)kPQStepCap ? maxdisc : kPQStepCap - 1].fetch_add(1, std::memory_order_relaxed);
+      g_topk_complete_sum.fetch_add(maxdisc, std::memory_order_relaxed);
+      g_topk_total_sum.fetch_add(tl_step, std::memory_order_relaxed);
+      g_topk_nq.fetch_add(1, std::memory_order_relaxed);
     }
 #endif
 
@@ -1249,7 +1474,25 @@ class Index {
     // Count this node's graph-link access (the tiered/cached quantity).
     if (_node_visit_counts) _node_visit_counts[node].fetch_add(1, std::memory_order_relaxed);
 #endif
+#if defined(USE_SSE) && defined(FLATNAV_PF_VEC_BURST)
+    // Exp B-burst (vector prefetch, depth-0, lightweight): prefetch the FIRST cache line of
+    // each not-yet-visited neighbor's vector upfront, so the (remote/UPI) fetches overlap
+    // the distance loop with MLP -- at a fraction of the instruction cost of the full-vector
+    // version (1 line vs ~8; the HW streamer picks up the rest on demand). Skipping visited
+    // neighbors avoids the prefetches/UPI traffic the distance loop below would just prune.
+    for (uint32_t j = 0; j < _M; j++) {
+      node_id_t nid = neighbor_node_links[j];
+      if (!visited_set->isVisited(nid))
+        _mm_prefetch(getNodeData(nid), _MM_HINT_T0);
+    }
+#endif
     query_visited_nodes_flags.push_back(_hub_nodes[node]);
+#ifdef FLATNAV_PROFILE_TRAJ
+    tl_traj.push_back(node);  // this node is being expanded now
+#endif
+#ifdef FLATNAV_PROFILE_PQ
+    uint32_t pq_fanout = 0;  // new (unvisited) neighbors fetched this expansion
+#endif
 #ifdef FLATNAV_PQ_GATE
     // Invariant for this whole expansion -- tl_gate_step only advances in beamSearch's loop --
     // so it is computed once here rather than per neighbor. An empty window (hi <= lo) can
@@ -1275,31 +1518,65 @@ class Index {
         continue;
       }
       visited_set->insert(/* num = */ neighbor_node_id);
+#ifdef FLATNAV_PROFILE_PQ
+      pq_fanout++;  // this neighbor is unvisited -> its vector is fetched/dist-computed below
+#endif
 #ifdef FLATNAV_PROFILE_VISITS
       // Count this neighbor's DATA (vector) access — the full activated footprint,
       // a superset of link-expanded nodes (these neighbors may never be expanded).
       if (_node_data_counts) _node_data_counts[neighbor_node_id].fetch_add(1, std::memory_order_relaxed);
 #endif
+      // Helper-thread staging: use the local staged copy of this neighbor's vector if it's
+      // available (seqlock-validated), else the remote original. Pure latency hint.
+      auto distFrom = [&](const char* v) {
+        return _distance->distance(/* x = */ query, /* y = */ v, /* asymmetric = */ true);
+      };
       float dist;
 #ifdef FLATNAV_PQ_GATE
       // Inside the PQ phase this neighbor is scored from its code -- no vector read at all.
       (use_pq ? tl_gate_pq : tl_gate_exact)++;
-      if (use_pq)
-        dist = pqDistance(neighbor_node_id);
-      else
+      float pq_raw = 0.0f;  // the code-only score, kept for the trace when the gate overrides it
+      if (use_pq) {
+        dist = pq_raw = pqDistance(neighbor_node_id);
+        // M15 quality gate: spend an exact vector read only where the PQ score is close enough to
+        // the beam's K-th best that the true distance could change this node's admission. M14
+        // killed the per-vector half of the design's gate (compressibility does not predict harm),
+        // leaving this margin as the only surviving signal -- and it costs nothing to evaluate.
+        // While the beam is still filling, max_dist is the entry node's distance, not a threshold:
+        // every node is admitted regardless, so the "could change the top-K" test is trivially
+        // true and the gate fetches (bounded by ~buffer_size reads per query).
+        if (_pq_margin > 0.0f &&
+            (neighbors.size() < (size_t)buffer_size ||
+             (dist < max_dist * (1.0f + _pq_margin) &&
+              (!_pq_margin_band || dist > max_dist * (1.0f - _pq_margin))))) {
+          dist = distFrom(getNodeData(neighbor_node_id));
+          tl_gate_pq--;
+          tl_gate_exact++;  // this neighbor did read a vector after all
+        }
+      } else
 #endif
-        dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(neighbor_node_id),
-                                   /* asymmetric = */ true);
+      if (!(_pf_buf && _pf_buf->computeIfStaged(neighbor_node_id, distFrom, dist)))
+        dist = distFrom(getNodeData(neighbor_node_id));
+#ifdef FLATNAV_PROFILE_TRAJ
+      if (dist < tl_term_dist) { tl_term_dist = dist; tl_term_node = neighbor_node_id; }
+#endif
 #ifdef FLATNAV_SPEC_TRACE
-      // Gated run, inside the PQ window (use_pq): `dist` is the PQ score that drove the scout to
-      // rank this neighbor; compute the exact distance alongside (measurement only -- this read
-      // does not exist in a real scout) so the tool can compare the scout's ranking to exact's.
-      if (use_pq && tl_spec_disc)
-        tl_spec_disc->push_back({tl_gate_step,
-                                 _distance->distance(/* x = */ query,
-                                                     /* y = */ getNodeData(neighbor_node_id),
-                                                     /* asymmetric = */ true),
-                                 dist});
+      // `dist` is whichever score drove this expansion; the other one is computed here as a
+      // measurement only (neither read exists in a real run). Inside the PQ window that means an
+      // extra vector read; outside it, an extra code lookup -- which is what lets the trace cover
+      // the whole EXACT trajectory, not just a PQ-gated window.
+      // Gate active -> in-window expansions only (M13's scout, unchanged). Gate off -> every
+      // expansion of the exact run (M14's per-vector error along the exact trajectory).
+      if (tl_spec_disc && tl_pq_lut && (use_pq || _pq_gate_hi <= _pq_gate_lo))
+        tl_spec_disc->push_back({tl_gate_step, (uint32_t)neighbor_node_id,
+                                 use_pq ? _distance->distance(/* x = */ query,
+                                                              /* y = */ getNodeData(neighbor_node_id),
+                                                              /* asymmetric = */ true)
+                                        : dist,
+                                 use_pq ? pq_raw : pqDistance(neighbor_node_id),
+                                 neighbors.size() >= (size_t)buffer_size
+                                     ? max_dist
+                                     : std::numeric_limits<float>::max()});
 #endif
 
       if (_collect_stats) {
@@ -1326,6 +1603,11 @@ class Index {
         }
       }
     }
+#ifdef FLATNAV_PROFILE_PQ
+    // Bucket this expansion's fan-out by its step (tl_step, not yet incremented here).
+    { uint32_t s = tl_step < kPQStepCap ? tl_step : kPQStepCap - 1;
+      g_step_fanout[s].fetch_add(pq_fanout, std::memory_order_relaxed); }
+#endif
   }
 
   /**
