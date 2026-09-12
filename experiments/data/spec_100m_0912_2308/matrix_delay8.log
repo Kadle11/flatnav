@@ -1,0 +1,79 @@
+[load] 26.7s nodes=100000000 dim=128 | PQ m=16 sub_dim=8 | queries=20000 ef=200 K=100 T=32
+[train] 200000 vectors x 16 subspaces, 25 iters in 3.2s
+[encode] 100000000 nodes in 70.5s
+[gate] PQ_FRAC=0.25 -> low-error threshold ||r||^2 < 8745.1
+[trace] 20000 queries in 4.9s, mean 207.7 expansions/query
+
+=== Top-1 frontier miss rate of one-step PQ speculation (from a validated beam) ===
+# sanity = replayed exact argmin == node really expanded (must be ~100%)
+# DELAY=8: candidates discovered in the last 8 step(s) are still PQ-only
+# win_pq = P(true winner is still PQ-only) = P(winner's residency <= DELAY)
+# mixed  = validated candidates exact, PQ-only ones PQ | all-PQ = every candidate PQ
+# low%   = mixed, but only newest neighbors in the lowest-error 25% use PQ (rest exact)
+# rnd%   = same, with a random 25% of nodes (control)
+# PQ share of discovered neighbors: mixed 100% | low 26.2% | rnd 25.0%
+
+steps       predictions    sanity    win_pq     mixed    all-PQ       low       rnd
+0:30             580000  100.000%   89.810%   61.843%   66.469%   23.583%   26.210%
+30:60            600000  100.000%   53.326%   66.210%   89.470%   24.547%   28.030%
+60:90            600000  100.000%   40.639%   64.168%   93.906%   23.243%   26.808%
+90:120           600000  100.000%   34.724%   63.385%   95.600%   22.702%   26.518%
+120:150          600000  100.000%   30.912%   62.732%   96.467%   22.080%   25.932%
+150:180          600000  100.000%   28.360%   62.465%   96.954%   21.938%   25.643%
+180:210          533590  100.000%   27.676%   62.340%   97.105%   21.340%   25.700%
+210:240           18379  100.000%   50.275%   67.702%   95.576%   13.369%   28.108%
+240:270            1597  100.000%   39.324%   63.306%   96.180%    7.702%   25.798%
+270:300             581  100.000%   36.833%   73.322%   97.246%    3.787%   35.628%
+300+                332  100.000%   38.855%   70.181%   96.084%    7.229%   22.289%
+all             4134479  100.000%   43.695%   63.350%   90.895%   22.744%   26.427%
+
+=== Safe validation delay k* per step: largest k with delays 1..k all correct (cap 16) ===
+# k*=0: even a 1-step delay misses here | >=k: share of steps where delay k needs no redo
+
+steps           k*=0       >=1       >=2       >=4       >=8   mean k*
+0:30          32.56%    67.44%    55.39%    44.12%    35.43%      6.25
+30:60         25.74%    74.26%    62.56%    48.08%    32.66%      5.84
+60:90         23.87%    76.13%    65.04%    50.91%    35.15%      6.21
+90:120        22.83%    77.17%    66.32%    52.20%    36.13%      6.36
+120:150       21.86%    78.14%    67.46%    53.26%    36.87%      6.48
+150:180       21.40%    78.60%    68.06%    53.86%    37.21%      6.53
+180:210       21.27%    78.73%    68.16%    53.92%    37.36%      6.55
+210:240       26.28%    73.72%    61.23%    46.37%    31.36%      5.65
+240:270       23.48%    76.52%    65.31%    52.10%    36.32%      6.30
+270:300       25.99%    74.01%    61.45%    46.82%    26.16%      5.09
+300+          24.40%    75.60%    65.66%    50.00%    29.22%      5.41
+all           24.23%    75.77%    64.69%    50.87%    35.79%      6.31
+
+=== Top-w coverage: P(true winner among the mixed heap's top w) (DELAY=8) ===
+# speculating the top w candidates per step misses only if the winner ranks below w
+# rejected = winner is PQ-only and PQ kept it out of the heap: no width recovers it
+
+steps           w=1       w=2       w=3       w=4       w=6       w=8       w=16  rejected
+0:30          38.16%    53.80%    63.04%    68.97%    76.18%    80.44%    88.73%     0.24%
+30:60         33.78%    51.22%    61.59%    67.69%    73.27%    75.64%    80.17%     2.19%
+60:90         35.83%    55.46%    67.09%    73.44%    78.62%    80.30%    82.52%     5.38%
+90:120        36.61%    57.34%    69.64%    76.23%    81.40%    82.86%    84.33%     8.20%
+120:150       37.26%    58.98%    71.56%    78.22%    83.26%    84.61%    85.74%    10.21%
+150:180       37.53%    59.89%    72.79%    79.51%    84.47%    85.72%    86.65%    11.62%
+180:210       37.66%    60.13%    73.22%    80.02%    84.85%    86.00%    86.73%    13.05%
+210:240       32.29%    51.54%    62.84%    68.99%    73.31%    74.42%    75.05%    24.42%
+240:270       36.69%    56.92%    66.81%    73.70%    78.58%    79.46%    81.03%    17.66%
+270:300       26.68%    50.43%    66.95%    74.18%    77.62%    79.17%    80.21%    17.90%
+300+          29.82%    58.13%    74.10%    78.61%    81.02%    82.23%    82.23%    17.17%
+all           36.64%    56.62%    68.34%    74.79%    80.21%    82.14%    84.89%     7.29%
+
+=== Validation schedules on the exact trajectory (K=100) ===
+# reads/q    = exact vector reads per query (traversal + final top-K certification)
+# read_steps = share of steps issuing >= 1 read; a step with none has no validation latency
+# step_miss  = share of steps whose pick differs from the exact search's next node
+# top-K      = share of the exact search's top-K the schedule returns
+
+schedule                   reads/q   (final)   %exact  read_steps  step_miss    top-K
+exact                       4176.9       0.0   100.0%      99.98%      0.00%  100.00%
+eager (M15) d=0.10          1073.3       0.0    25.7%      78.42%      5.93%  100.00%
+lazy d=0.10 a=0.00           281.1       0.0     6.7%      89.53%     60.80%  100.00%
+lazy d=0.10 a=0.05           373.0       0.0     8.9%      90.03%     43.29%  100.00%
+lazy d=0.10 a=0.10           539.8       0.0    12.9%      92.13%     26.06%  100.00%
+lazy d=0.10 a=0.15           682.7       0.0    16.3%      92.14%     14.87%  100.00%
+lazy d=0.10 a=0.20           789.0       0.0    18.9%      90.68%      9.91%  100.00%
+lazy d=0.10 a=0.30           936.2       0.0    22.4%      86.94%      7.21%  100.00%
