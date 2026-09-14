@@ -35,6 +35,10 @@ class VisitedSet {
 
   inline void insert(const uint32_t num) { _table[num] = _mark; }
 
+  // Undo a single insert (speculative rollback). Writing 0 rather than _mark - 1 is what makes
+  // this safe: clear() skips 0 when it wraps, so mark 0 is never live for any query.
+  inline void erase(const uint32_t num) { _table[num] = 0; }
+
   inline uint32_t size() const { return _table_size; }
 
   inline void clear() {

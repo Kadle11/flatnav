@@ -115,6 +115,58 @@ inline thread_local uint32_t tl_gate_exact = 0;
 inline std::atomic<uint64_t> g_gate_pq_dists{0};       // distances served from PQ codes
 inline std::atomic<uint64_t> g_gate_exact_dists{0};    // traversal distances that read a full vector
 inline std::atomic<uint64_t> g_gate_rescore_dists{0};  // vector reads spent rescoring PQ-ranked queues
+
+// specBeamSearch tallies, same per-query-then-flush discipline as the gate counters above.
+//   checks     -- predictions tested. The first pick off an empty ring is correct by construction
+//                 and is not one.
+//   floor      -- checks whose true winner no width could have found, because the speculative
+//                 lane's score kept it off the overlay of the step that discovered it. The
+//                 ceiling on what widening the search can buy.
+//   miss_rej / miss_tie / miss_order -- a miss broken down by where the predicted node ended up,
+//                 filled in only under setSpecDiag(). Rejected: never admitted to the beam, so no
+//                 ranking could have found it. Tie: admitted at the same distance as the node
+//                 actually expanded, and lost on heap order alone. Order: admitted, at a
+//                 different distance, and genuinely ranked wrong.
+//   committed  -- exact vector reads performed, which equals the exact search's own count
+//   wasted     -- vectors belonging to discarded steps: the bandwidth a speculative step costs
+//                 when its prediction does not hold.
+inline thread_local uint32_t tl_spec_checks = 0;
+inline thread_local uint32_t tl_spec_hits = 0;
+inline thread_local uint32_t tl_spec_misses = 0;
+inline thread_local uint32_t tl_spec_miss_rejected = 0;
+inline thread_local uint32_t tl_spec_miss_tie = 0;
+inline thread_local uint32_t tl_spec_miss_order = 0;
+inline thread_local uint32_t tl_spec_floor = 0;
+
+// Which speculative step discovered a node, and whether its score got it onto that step's
+// overlay. Together with the in-flight range recorded on each step, this answers whether a node
+// was reachable by the speculative lane at the moment it made a given pick. Kept per query, under
+// setSpecDiag() only.
+struct SpecOrigin { uint32_t step; bool admitted; };
+inline thread_local std::unordered_map<uint32_t, SpecOrigin> tl_spec_origin;
+
+// Checks and misses bucketed by how many steps were actually in flight when the prediction was
+// made, which a miss resets to zero. The configured depth is only an upper bound on this.
+inline constexpr int kSpecDepthCap = 17;
+inline thread_local uint32_t tl_spec_depth_checks[kSpecDepthCap] = {};
+inline thread_local uint32_t tl_spec_depth_misses[kSpecDepthCap] = {};
+inline std::atomic<uint64_t> g_spec_depth_checks[kSpecDepthCap];
+inline std::atomic<uint64_t> g_spec_depth_misses[kSpecDepthCap];
+inline thread_local uint32_t tl_spec_discarded = 0;
+inline thread_local uint32_t tl_spec_stalls = 0;
+inline thread_local uint32_t tl_spec_committed = 0;
+inline thread_local uint32_t tl_spec_wasted = 0;
+inline std::atomic<uint64_t> g_spec_checks{0};
+inline std::atomic<uint64_t> g_spec_hits{0};
+inline std::atomic<uint64_t> g_spec_misses{0};
+inline std::atomic<uint64_t> g_spec_miss_rejected{0};
+inline std::atomic<uint64_t> g_spec_miss_tie{0};
+inline std::atomic<uint64_t> g_spec_miss_order{0};
+inline std::atomic<uint64_t> g_spec_floor{0};
+inline std::atomic<uint64_t> g_spec_discarded{0};
+inline std::atomic<uint64_t> g_spec_stalls{0};
+inline std::atomic<uint64_t> g_spec_committed{0};
+inline std::atomic<uint64_t> g_spec_wasted{0};
 #endif
 
 #ifdef FLATNAV_SPEC_TRACE
@@ -198,6 +250,50 @@ class Index {
     };
     return Hack::get(pq);
   }
+
+#ifdef FLATNAV_PQ_GATE
+  // The r best entries of a binary max-heap's array, best first, WITHOUT popping -- so the
+  // speculative lane can read V's pending candidates without disturbing them. Bounded best-first
+  // over the implicit tree: the array root is the max, and a node's children (2i+1, 2i+2) are the
+  // only entries that can succeed it, so a frontier heap of at most 2r indices yields them in
+  // order. O(r log r) against O(n) for a full sort. `skip` filters ids already claimed by an
+  // in-flight step; its subtree is still expanded, since a skipped parent can hide good children.
+  template <typename Skip>
+  static void heapTopR(const std::vector<dist_node_t>& heap, int r, const Skip& skip,
+                       std::vector<dist_node_t>& out) {
+    out.clear();
+    if (heap.empty() || r <= 0) return;
+    std::priority_queue<std::pair<float, uint32_t>> frontier;
+    frontier.emplace(heap[0].first, 0u);
+    while (!frontier.empty() && (int)out.size() < r) {
+      const uint32_t i = frontier.top().second;
+      frontier.pop();
+      if (!skip(heap[i].second)) out.push_back(heap[i]);
+      const uint32_t l = 2 * i + 1, rt = 2 * i + 2;
+      if (l < heap.size()) frontier.emplace(heap[l].first, l);
+      if (rt < heap.size()) frontier.emplace(heap[rt].first, rt);
+    }
+  }
+
+  // One speculative step. `fresh` is the main pick's unvisited neighbours, ALREADY marked visited
+  // (so a discard has to un-mark them); `overlay` is their PQ scores, negated to match the
+  // candidate queue's convention, standing in for V.candidates entries until validation replaces
+  // them with exact ones.
+  struct SpecStep {
+    node_id_t node = 0;
+    std::vector<node_id_t> fresh;
+    std::vector<dist_node_t> overlay;
+    // Step ids are monotonic within a query, never reused after a discard. `inflight_lo` is the
+    // oldest id in flight when this step was chosen, which bounds the steps whose neighbours had
+    // reached the overlay but not yet the candidate queue at that moment.
+    uint32_t id = 0;
+    uint32_t inflight_lo = 0;
+    // Steps in flight when this one was chosen. This, not _spec_depth, is how far ahead the
+    // speculation actually ran for this step: a miss empties the ring, so the steps chosen while
+    // it refills see far fewer unvalidated neighbours than the configured depth allows.
+    uint32_t depth_at_push = 0;
+  };
+#endif
 
   // NUMA-aware storage. The data and the graph are kept in two separate,
   // contiguous (structure-of-arrays) allocations so each can be bound to its
@@ -292,6 +388,17 @@ class Index {
   // two-sided band (skip nodes PQ places safely inside). Set via setPQMargin().
   float _pq_margin = 0.0f;
   bool _pq_margin_band = false;
+  // Speculate-then-validate traversal (specBeamSearch). _spec_depth (k) is how many steps
+  // validation trails speculation, _spec_width (w) how many candidates are speculated per step.
+  // k = 0 leaves search() on beamSearch. _spec_oracle scores the speculative lane with exact
+  // distances, which removes approximation error from the prediction. Set via setSpecPipeline().
+  int _spec_depth = 0;
+  int _spec_width = 1;
+  bool _spec_oracle = false;
+  // Classify every miss by scanning the candidate queue for the node that was predicted. Linear
+  // in the queue and only worth paying for when the breakdown is the measurement. Set via
+  // setSpecDiag().
+  bool _spec_diag = false;
 #endif
 
   // Randomization parameters
@@ -516,6 +623,17 @@ class Index {
   // it. `band` = two-sided (only near-ties are verified) vs one-sided (everything at or below the
   // threshold is verified too).
   void setPQMargin(float margin, bool band) { _pq_margin = margin; _pq_margin_band = band; }
+
+  // k = validation depth (0 = off), w = speculation width. Requires a per-query LUT in
+  // flatnav::tl_pq_lut, as the gate does. `oracle` scores the speculative lane with exact
+  // distances instead of PQ, leaving the stale admission threshold as the only source of misses.
+  void setSpecPipeline(int k, int w, bool oracle = false) {
+    _spec_depth = k;
+    _spec_width = w < 1 ? 1 : w;
+    _spec_oracle = oracle;
+  }
+
+  void setSpecDiag(bool on) { _spec_diag = on; }
 #endif
 
   // Helper-thread vector staging (PrefetchStaging.h). When configured, each pop enqueues
@@ -839,10 +957,20 @@ class Index {
     } else {
       entry_node = initializeSearch(query, num_initializations);
     }
+    const int buffer_size = std::max(K, ef_search);
+#ifdef FLATNAV_PQ_GATE
+    PriorityQueue neighbors =
+        (_spec_depth > 0 && tl_pq_lut)
+            ? specBeamSearch(/* query = */ query, /* entry_node = */ entry_node,
+                             /* buffer_size = */ buffer_size)
+            : beamSearch<true>(/* query = */ query, /* entry_node = */ entry_node,
+                               /* buffer_size = */ buffer_size);
+#else
     PriorityQueue neighbors =
         beamSearch<true>(/* query = */ query,
                          /* entry_node = */ entry_node,
-                         /* buffer_size = */ std::max(K, ef_search));
+                         /* buffer_size = */ buffer_size);
+#endif
     auto size = neighbors.size();
     std::vector<dist_label_t> results;
     results.reserve(size);
@@ -1609,6 +1737,257 @@ class Index {
       g_step_fanout[s].fetch_add(pq_fanout, std::memory_order_relaxed); }
 #endif
   }
+
+#ifdef FLATNAV_PQ_GATE
+  /**
+   * @brief Beam search that advances on PQ scores and validates with exact distances k steps
+   * behind, so a node's vector is known to be needed k steps before it is read.
+   *
+   * The validated lane keeps the `neighbors`/`candidates` heaps and reproduces beamSearch's
+   * pop/emplace sequence exactly -- same pop, same link order, same in-loop max_dist update --
+   * so the returned beam is bit-identical to beamSearch's. The speculative lane reads only links
+   * and PQ codes, choosing which node the validated lane will expand next; when that choice turns
+   * out wrong, the in-flight steps are discarded and the validated lane's own top is expanded
+   * instead.
+   *
+   * Only _spec_width == 1 is implemented. Larger widths currently widen the candidate scan but
+   * still speculate on a single node per step.
+   */
+  PriorityQueue specBeamSearch(const void* query, const node_id_t entry_node, const int buffer_size) {
+    const uint32_t ring_size = static_cast<uint32_t>(_spec_depth) + 1;
+
+    PriorityQueue neighbors;   // +dist, top = furthest member of the beam
+    PriorityQueue candidates;  // -dist, top = nearest pending node
+    auto* visited_set = _visited_set_pool->pollAvailableSet();
+    visited_set->clear();
+
+    tl_spec_checks = tl_spec_hits = tl_spec_misses = tl_spec_miss_rejected = 0;
+    tl_spec_miss_tie = tl_spec_miss_order = tl_spec_floor = 0;
+    tl_spec_discarded = tl_spec_stalls = tl_spec_committed = tl_spec_wasted = 0;
+    if (_spec_diag) {
+      tl_spec_origin.clear();
+      std::memset(tl_spec_depth_checks, 0, sizeof(tl_spec_depth_checks));
+      std::memset(tl_spec_depth_misses, 0, sizeof(tl_spec_depth_misses));
+    }
+
+    float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
+                                     /* asymmetric = */ true);
+    tl_spec_committed++;
+    float max_dist = dist;
+    candidates.emplace(-dist, entry_node);
+    neighbors.emplace(dist, entry_node);
+    visited_set->insert(entry_node);
+
+    std::vector<SpecStep> ring(ring_size);
+    uint32_t head = 0, depth = 0, next_step_id = 0;
+    std::vector<dist_node_t> top;  // heapTopR scratch
+
+    auto slot = [&](uint32_t i) -> SpecStep& { return ring[(head + i) % ring_size]; };
+    auto outstanding = [&](node_id_t n) {
+      for (uint32_t i = 0; i < depth; i++)
+        if (slot(i).node == n) return true;
+      return false;
+    };
+
+    // Read `node`'s links, take and mark its unvisited neighbours, and admit them onto the
+    // overlay. max_dist here is k steps stale and therefore looser than the threshold validation
+    // will apply, so the overlay can hold nodes the beam later rejects.
+    auto expand = [&](SpecStep& st, node_id_t node) {
+      st.node = node;
+      st.fresh.clear();
+      st.overlay.clear();
+      const node_id_t* links = getNodeLinks(node);
+      for (uint32_t i = 0; i < _M; i++) {
+        const node_id_t nbr = links[i];
+        if (visited_set->isVisited(nbr)) continue;
+        visited_set->insert(nbr);
+        st.fresh.push_back(nbr);
+      }
+      const bool filling = neighbors.size() < static_cast<size_t>(buffer_size);
+      for (const node_id_t nbr : st.fresh) {
+        const float d = _spec_oracle ? _distance->distance(/* x = */ query,
+                                                           /* y = */ getNodeData(nbr),
+                                                           /* asymmetric = */ true)
+                                     : pqDistance(nbr);
+        const bool admit = filling || d < max_dist;
+        if (admit) st.overlay.emplace_back(-d, nbr);
+        if (_spec_diag) tl_spec_origin[nbr] = {st.id, admit};
+      }
+    };
+
+    auto push = [&](node_id_t node) {
+      SpecStep& st = slot(depth);
+      st.id = next_step_id++;
+      st.inflight_lo = depth > 0 ? slot(0).id : st.id;
+      st.depth_at_push = depth;
+      expand(st, node);
+      depth++;
+    };
+
+    // Un-mark the nodes each in-flight step was the first to visit. Per-step fresh lists are
+    // disjoint -- a node marked by one step is never unvisited for a later one -- so erasing them
+    // in any order restores exactly the state before these steps ran.
+    auto discardAll = [&]() {
+      for (uint32_t i = 0; i < depth; i++) {
+        SpecStep& st = slot(i);
+        for (const node_id_t n : st.fresh) {
+          visited_set->erase(n);
+          if (_spec_diag) tl_spec_origin.erase(n);
+        }
+        tl_spec_wasted += static_cast<uint32_t>(st.fresh.size());
+      }
+      tl_spec_discarded += depth;
+      depth = 0;
+    };
+
+    // The nearest pending candidate that no in-flight step has claimed, across both the beam's
+    // queue and the overlay. Scores are negated throughout, so larger is nearer.
+    auto pick = [&](node_id_t& out) {
+      heapTopR(pqHeap(candidates), _spec_width + static_cast<int>(ring_size), outstanding, top);
+      float best = 0.0f;
+      bool found = false;
+      if (!top.empty()) {
+        best = top[0].first;
+        out = top[0].second;
+        found = true;
+      }
+      for (uint32_t i = 0; i < depth; i++)
+        for (const dist_node_t& e : slot(i).overlay)
+          if ((!found || e.first > best) && !outstanding(e.second)) {
+            best = e.first;
+            out = e.second;
+            found = true;
+          }
+      if (found && neighbors.size() >= static_cast<size_t>(buffer_size) && -best > max_dist)
+        found = false;
+      return found;
+    };
+
+    bool finished = false;
+    while (!finished) {
+      bool produced = false;
+      if (depth < ring_size) {
+        node_id_t n;
+        if (pick(n)) {
+          push(n);
+          produced = true;
+        }
+      }
+      if (!produced) {
+        // With nothing in flight, the pick fails on exactly beamSearch's loop guard: an empty
+        // queue, or a full beam whose nearest pending candidate is already beyond max_dist.
+        if (depth == 0) break;
+        tl_spec_stalls++;
+      }
+
+      // Having added a step, validation only needs to catch up to depth k. Having added none it
+      // drains the ring completely, or the loop would spin with work still in flight.
+      const uint32_t drain_to = produced ? static_cast<uint32_t>(_spec_depth) : 0;
+      while (depth > drain_to) {
+        if (candidates.empty() ||
+            (neighbors.size() >= static_cast<size_t>(buffer_size) &&
+             -candidates.top().first > max_dist)) {
+          discardAll();
+          finished = true;
+          break;
+        }
+
+        // The oldest in-flight step's node is candidates.top(), either by construction for the
+        // first pick off an empty ring, or because the check at the bottom re-established it.
+        SpecStep& st = slot(0);
+        candidates.pop();
+#ifdef FLATNAV_SPEC_TRACE
+        if (tl_spec_expand) tl_spec_expand->push_back(st.node);
+#endif
+        for (const node_id_t nbr : st.fresh) {
+          const float d = _distance->distance(/* x = */ query, /* y = */ getNodeData(nbr),
+                                              /* asymmetric = */ true);
+          tl_spec_committed++;
+          if (neighbors.size() < static_cast<size_t>(buffer_size) || d < max_dist) {
+            candidates.emplace(-d, nbr);
+            neighbors.emplace(d, nbr);
+            if (neighbors.size() > static_cast<size_t>(buffer_size)) neighbors.pop();
+            if (!neighbors.empty()) max_dist = neighbors.top().first;
+          }
+        }
+
+        head = (head + 1) % ring_size;
+        depth--;
+
+        if (depth == 0) continue;
+        if (candidates.empty()) {
+          discardAll();
+          finished = true;
+          break;
+        }
+        tl_spec_checks++;
+        const node_id_t predicted = slot(0).node;
+        const node_id_t truth = candidates.top().second;
+        // Could this pick have found the true winner at any width? Only if the winner was visible
+        // when the pick was made: already in the candidate queue, or on the overlay of a step that
+        // was then in flight. A winner discovered by an in-flight step but scored off its overlay
+        // was invisible, and no width recovers it.
+        if (_spec_diag) {
+          const auto it = tl_spec_origin.find(truth);
+          if (it != tl_spec_origin.end() && it->second.step >= slot(0).inflight_lo &&
+              !it->second.admitted)
+            tl_spec_floor++;
+        }
+        const bool hit = (predicted == truth);
+        if (_spec_diag) {
+          const uint32_t d = std::min(slot(0).depth_at_push,
+                                      static_cast<uint32_t>(kSpecDepthCap - 1));
+          tl_spec_depth_checks[d]++;
+          if (!hit) tl_spec_depth_misses[d]++;
+        }
+        if (hit) {
+          tl_spec_hits++;
+          continue;
+        }
+        tl_spec_misses++;
+        // Where the predicted node actually ended up. A node absent from the queue was never
+        // admitted, by this validation or an earlier one, so no ranking could have picked it; one
+        // present at the same distance as the node expanded lost on heap order alone.
+        if (_spec_diag) {
+          const std::vector<dist_node_t>& heap = pqHeap(candidates);
+          const float truth_dist = -candidates.top().first;
+          bool present = false;
+          float predicted_dist = 0.0f;
+          for (const dist_node_t& e : heap)
+            if (e.second == predicted) {
+              present = true;
+              predicted_dist = -e.first;
+              break;
+            }
+          if (!present) tl_spec_miss_rejected++;
+          else if (predicted_dist == truth_dist) tl_spec_miss_tie++;
+          else tl_spec_miss_order++;
+        }
+        discardAll();
+        push(truth);
+      }
+    }
+
+    _visited_set_pool->pushVisitedSet(/* visited_set = */ visited_set);
+    g_spec_checks.fetch_add(tl_spec_checks, std::memory_order_relaxed);
+    g_spec_hits.fetch_add(tl_spec_hits, std::memory_order_relaxed);
+    g_spec_misses.fetch_add(tl_spec_misses, std::memory_order_relaxed);
+    g_spec_miss_rejected.fetch_add(tl_spec_miss_rejected, std::memory_order_relaxed);
+    g_spec_miss_tie.fetch_add(tl_spec_miss_tie, std::memory_order_relaxed);
+    g_spec_miss_order.fetch_add(tl_spec_miss_order, std::memory_order_relaxed);
+    g_spec_floor.fetch_add(tl_spec_floor, std::memory_order_relaxed);
+    if (_spec_diag)
+      for (int i = 0; i < kSpecDepthCap; i++) {
+        g_spec_depth_checks[i].fetch_add(tl_spec_depth_checks[i], std::memory_order_relaxed);
+        g_spec_depth_misses[i].fetch_add(tl_spec_depth_misses[i], std::memory_order_relaxed);
+      }
+    g_spec_discarded.fetch_add(tl_spec_discarded, std::memory_order_relaxed);
+    g_spec_stalls.fetch_add(tl_spec_stalls, std::memory_order_relaxed);
+    g_spec_committed.fetch_add(tl_spec_committed, std::memory_order_relaxed);
+    g_spec_wasted.fetch_add(tl_spec_wasted, std::memory_order_relaxed);
+    return neighbors;
+  }
+#endif
 
   /**
    * @brief Selects neighbors from the PriorityQueue, according to the HNSW

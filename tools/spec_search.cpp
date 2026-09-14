@@ -1,0 +1,343 @@
+// Live speculate-then-validate search (Index::specBeamSearch), against the exact search.
+//
+//   spec_search <index.bin> <query.fvecs> [threads=16] [ef=200] [K=100]
+//
+// The pipeline advances on PQ scores and validates with exact distances k steps behind. Its
+// validated lane reproduces beamSearch's pop/emplace sequence, so for every (k, w) this checks:
+//
+//   results    -- the returned top-K is bit-identical to the exact search's
+//   expansions -- the ordered list of expanded nodes is identical, not merely the same length
+//   reads      -- exact vector reads equal the exact search's own count
+//
+// The first two are hard gates: the validated lane is correct however badly speculation predicts,
+// so a mismatch is a visited-set bookkeeping bug. What speculation itself gets right is the miss
+// rate, and ORACLE=1 scores the speculative lane with exact distances to separate the prediction
+// from PQ's error -- every remaining miss is then a node the stale admission threshold let onto
+// the overlay and the beam later rejected, reported as `rej`.
+//
+// env:
+//   PQ_M=16  TRAIN=200000  ITERS=25   PQ codebook config (as pq_top1)
+//   DEPTHS=1,2,3,4,8                  validation depths k to sweep
+//   WIDTHS=1                          speculation widths w (only w=1 is implemented)
+//   ORACLE=0                          1 = score the speculative lane exact instead of PQ
+//   NQ=...                            cap on the number of queries
+#define FLATNAV_PQ_GATE
+#define FLATNAV_SPEC_TRACE
+#include <flatnav/distances/SquaredL2Distance.h>
+#include <flatnav/index/Index.h>
+#include <flatnav/util/Multithreading.h>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cfloat>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <random>
+#include <string>
+#include <vector>
+
+using flatnav::Index;
+using flatnav::distances::SquaredL2Distance;
+using flatnav::util::DataType;
+using dist_t = SquaredL2Distance<DataType::float32>;
+using clk = std::chrono::steady_clock;
+
+static const int kCentroids = 256;
+
+// --- fvecs reader + PQ training: identical to tools/pq_top1.cpp ---
+static std::vector<float> readFvecs(const char* path, int& dim, size_t& n) {
+  int fd = open(path, O_RDONLY); if (fd < 0) { perror("open fvecs"); exit(1); }
+  struct stat st; fstat(fd, &st); size_t fsize = st.st_size;
+  void* map = mmap(nullptr, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED) { perror("mmap fvecs"); exit(1); }
+  const char* base = static_cast<const char*>(map);
+  dim = *reinterpret_cast<const int32_t*>(base);
+  size_t rec = 4 + (size_t)dim * 4; n = fsize / rec;
+  std::vector<float> out(n * dim);
+  for (size_t i = 0; i < n; i++) memcpy(&out[i*dim], base + i*rec + 4, dim*4);
+  munmap(map, fsize); close(fd); return out;
+}
+
+static inline float l2(const float* a, const float* b, int d) {
+  float s = 0.0f;
+  for (int i = 0; i < d; i++) { float t = a[i] - b[i]; s += t * t; }
+  return s;
+}
+
+static inline int nearestCentroid(const float* sub, const float* codebook, int sub_dim) {
+  float best = FLT_MAX; int bc = 0;
+  for (int c = 0; c < kCentroids; c++) {
+    float d = l2(sub, codebook + (size_t)c * sub_dim, sub_dim);
+    if (d < best) { best = d; bc = c; }
+  }
+  return bc;
+}
+
+static void trainSubspace(const float* train, size_t n, int sub_dim, int iters,
+                          float* codebook, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::vector<size_t> perm(n);
+  std::iota(perm.begin(), perm.end(), (size_t)0);
+  std::shuffle(perm.begin(), perm.end(), rng);
+  for (int c = 0; c < kCentroids; c++)
+    memcpy(codebook + (size_t)c * sub_dim, train + perm[c] * sub_dim, sub_dim * sizeof(float));
+
+  std::vector<uint8_t> assign(n);
+  std::vector<double> sums((size_t)kCentroids * sub_dim);
+  std::vector<uint32_t> counts(kCentroids);
+  for (int it = 0; it < iters; it++) {
+    for (size_t i = 0; i < n; i++)
+      assign[i] = (uint8_t)nearestCentroid(train + i * sub_dim, codebook, sub_dim);
+    std::fill(sums.begin(), sums.end(), 0.0);
+    std::fill(counts.begin(), counts.end(), 0u);
+    for (size_t i = 0; i < n; i++) {
+      int c = assign[i];
+      counts[c]++;
+      for (int k = 0; k < sub_dim; k++) sums[(size_t)c * sub_dim + k] += train[i * sub_dim + k];
+    }
+    for (int c = 0; c < kCentroids; c++) {
+      if (counts[c] == 0) {
+        memcpy(codebook + (size_t)c * sub_dim, train + (rng() % n) * sub_dim, sub_dim * sizeof(float));
+        continue;
+      }
+      for (int k = 0; k < sub_dim; k++)
+        codebook[(size_t)c * sub_dim + k] = (float)(sums[(size_t)c * sub_dim + k] / counts[c]);
+    }
+  }
+}
+
+static void buildLUT(const float* q, const float* codebooks, int m, int sub_dim, float* lut) {
+  for (int j = 0; j < m; j++) {
+    const float* sub = q + (size_t)j * sub_dim;
+    const float* cb = codebooks + (size_t)j * kCentroids * sub_dim;
+    for (int c = 0; c < kCentroids; c++)
+      lut[(size_t)j * kCentroids + c] = l2(sub, cb + (size_t)c * sub_dim, sub_dim);
+  }
+}
+
+static std::vector<int> parseInts(const char* env, const char* fallback) {
+  std::string s = env ? env : fallback;
+  std::vector<int> out;
+  for (size_t p = 0; p < s.size();) {
+    size_t e = s.find(',', p);
+    if (e == std::string::npos) e = s.size();
+    out.push_back(atoi(s.substr(p, e - p).c_str()));
+    p = e + 1;
+  }
+  return out;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: %s <index.bin> <query.fvecs> [threads=16] [ef=200] [K=100]\n", argv[0]);
+    return 1;
+  }
+  const int threads = argc > 3 ? atoi(argv[3]) : 16;
+  const int ef = argc > 4 ? atoi(argv[4]) : 200;
+  const int K = argc > 5 ? atoi(argv[5]) : 100;
+  const int m = getenv("PQ_M") ? atoi(getenv("PQ_M")) : 16;
+  const size_t n_train = getenv("TRAIN") ? (size_t)atoll(getenv("TRAIN")) : 200000;
+  const int iters = getenv("ITERS") ? atoi(getenv("ITERS")) : 25;
+  const bool oracle = getenv("ORACLE") && atoi(getenv("ORACLE")) != 0;
+  const bool diag = getenv("DIAG") && atoi(getenv("DIAG")) != 0;
+  const std::vector<int> depths = parseInts(getenv("DEPTHS"), "1,2,3,4,8");
+  const std::vector<int> widths = parseInts(getenv("WIDTHS"), "1");
+
+  int qdim; size_t nq; std::vector<float> queries = readFvecs(argv[2], qdim, nq);
+  if (getenv("NQ")) nq = std::min(nq, (size_t)atoll(getenv("NQ")));
+
+  auto t0 = clk::now();
+  auto index = Index<dist_t, int>::loadIndex(argv[1]);
+  const size_t N = index->currentNumNodes();
+  const int dim = (int)(index->dataSizeBytes() / sizeof(float));
+  if (dim % m) { fprintf(stderr, "dim %d not divisible by PQ_M %d\n", dim, m); return 1; }
+  const int sub_dim = dim / m;
+  printf("[load] %.1fs nodes=%zu dim=%d | PQ m=%d sub_dim=%d | queries=%zu ef=%d K=%d T=%d%s\n",
+         std::chrono::duration<double>(clk::now()-t0).count(), N, dim, m, sub_dim, nq, ef, K,
+         threads, oracle ? " | ORACLE" : "");
+  fflush(stdout);
+
+  const char* vectors = index->vectorsMemory();
+  const size_t stride = index->dataSizeBytes();
+  auto nodeVec = [&](size_t n) { return reinterpret_cast<const float*>(vectors + n * stride); };
+
+  const size_t n_tr = std::min(n_train, N);
+  const size_t tstep = std::max<size_t>(1, N / n_tr);
+  std::vector<float> codebooks((size_t)m * kCentroids * sub_dim);
+  auto t1 = clk::now();
+  flatnav::executeInParallel(0, (uint32_t)m, (uint32_t)std::min(threads, m), [&](uint32_t j) {
+    std::vector<float> slice(n_tr * sub_dim);
+    for (size_t i = 0; i < n_tr; i++)
+      memcpy(&slice[i * sub_dim], nodeVec(i * tstep) + (size_t)j * sub_dim, sub_dim * sizeof(float));
+    trainSubspace(slice.data(), n_tr, sub_dim, iters,
+                  &codebooks[(size_t)j * kCentroids * sub_dim], 1234u + j);
+  });
+  printf("[train] %zu vectors x %d subspaces, %d iters in %.1fs\n", n_tr, m, iters,
+         std::chrono::duration<double>(clk::now()-t1).count());
+
+  std::vector<uint8_t> codes(N * m);
+  const size_t CHUNK = 65536;
+  const uint32_t nchunks = (uint32_t)((N + CHUNK - 1) / CHUNK);
+  auto t2 = clk::now();
+  flatnav::executeInParallel(0, nchunks, (uint32_t)threads, [&](uint32_t ch) {
+    size_t clo = (size_t)ch * CHUNK, chi = std::min(clo + CHUNK, N);
+    for (size_t n = clo; n < chi; n++)
+      for (int j = 0; j < m; j++) {
+        const float* sub = nodeVec(n) + (size_t)j * sub_dim;
+        const float* cb = &codebooks[(size_t)j * kCentroids * sub_dim];
+        codes[n * m + j] = (uint8_t)nearestCentroid(sub, cb, sub_dim);
+      }
+  });
+  printf("[encode] %zu nodes in %.1fs\n\n", N, std::chrono::duration<double>(clk::now()-t2).count());
+  fflush(stdout);
+
+  // Codes installed, gate window empty: beamSearch stays fully exact and is the baseline.
+  index->setPQGate(codes.data(), (uint32_t)m, 0, 0);
+
+  const uint32_t BLOCK = 64;
+  const uint32_t nblocks = (uint32_t)((nq + BLOCK - 1) / BLOCK);
+
+  // --- exact baseline: results, expansion order, and vector reads, per query ---
+  std::vector<std::vector<std::pair<float, int>>> base_res(nq);
+  std::vector<std::vector<uint32_t>> base_exp(nq);
+  std::vector<uint32_t> base_reads(nq);
+  index->setSpecPipeline(0, 1, false);
+  auto t3 = clk::now();
+  flatnav::executeInParallel(0, nblocks, (uint32_t)threads, [&](uint32_t blk) {
+    std::vector<float> lut((size_t)m * kCentroids);
+    size_t qlo = (size_t)blk * BLOCK, qhi = std::min(qlo + BLOCK, nq);
+    for (size_t i = qlo; i < qhi; i++) {
+      buildLUT(&queries[i * qdim], codebooks.data(), m, sub_dim, lut.data());
+      base_exp[i].clear();
+      flatnav::tl_pq_lut = lut.data();
+      flatnav::tl_spec_expand = &base_exp[i];
+      base_res[i] = index->search((const void*)&queries[i * qdim], K, ef);
+      flatnav::tl_spec_expand = nullptr;
+      flatnav::tl_pq_lut = nullptr;
+      base_reads[i] = flatnav::tl_gate_exact + 1;  // + the entry node, which the gate does not count
+    }
+  });
+  const double base_secs = std::chrono::duration<double>(clk::now()-t3).count();
+  double base_steps = 0, base_rd = 0;
+  for (size_t i = 0; i < nq; i++) { base_steps += base_exp[i].size(); base_rd += base_reads[i]; }
+  printf("[exact] %zu queries in %.2fs (%.0f qps), mean %.1f expansions, %.1f reads/query\n\n",
+         nq, base_secs, nq / base_secs, base_steps / nq, base_rd / nq);
+  fflush(stdout);
+
+  index->setSpecDiag(diag);
+  if (diag)
+    printf("%-5s %-5s %9s %9s %9s %9s %9s %9s %9s\n", "k", "w", "checks/q", "miss%", "floor%",
+           "rej%", "tie%", "order%", "wasted/q");
+  else
+    printf("%-5s %-5s %9s %9s %9s %9s %9s %9s %8s\n", "k", "w", "checks/q", "miss%", "disc/q",
+           "reads/q", "wasted/q", "stalls/q", "qps");
+
+  bool all_ok = true;
+  for (int k : depths) {
+    for (int w : widths) {
+      flatnav::g_spec_checks = 0; flatnav::g_spec_hits = 0; flatnav::g_spec_misses = 0;
+      flatnav::g_spec_miss_rejected = 0; flatnav::g_spec_discarded = 0;
+      flatnav::g_spec_stalls = 0; flatnav::g_spec_committed = 0; flatnav::g_spec_wasted = 0;
+      flatnav::g_spec_miss_tie = 0; flatnav::g_spec_miss_order = 0; flatnav::g_spec_floor = 0;
+      for (int i = 0; i < flatnav::kSpecDepthCap; i++) {
+        flatnav::g_spec_depth_checks[i] = 0;
+        flatnav::g_spec_depth_misses[i] = 0;
+      }
+      index->setSpecPipeline(k, w, oracle);
+
+      std::atomic<uint64_t> bad_res{0}, bad_exp{0}, bad_reads{0};
+      auto ts = clk::now();
+      flatnav::executeInParallel(0, nblocks, (uint32_t)threads, [&](uint32_t blk) {
+        std::vector<float> lut((size_t)m * kCentroids);
+        std::vector<uint32_t> exp;
+        size_t qlo = (size_t)blk * BLOCK, qhi = std::min(qlo + BLOCK, nq);
+        for (size_t i = qlo; i < qhi; i++) {
+          buildLUT(&queries[i * qdim], codebooks.data(), m, sub_dim, lut.data());
+          exp.clear();
+          flatnav::tl_pq_lut = lut.data();
+          flatnav::tl_spec_expand = &exp;
+          auto res = index->search((const void*)&queries[i * qdim], K, ef);
+          flatnav::tl_spec_expand = nullptr;
+          flatnav::tl_pq_lut = nullptr;
+
+          if (res != base_res[i]) bad_res.fetch_add(1, std::memory_order_relaxed);
+          if (exp != base_exp[i]) bad_exp.fetch_add(1, std::memory_order_relaxed);
+          if (flatnav::tl_spec_committed != base_reads[i])
+            bad_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+      const double secs = std::chrono::duration<double>(clk::now()-ts).count();
+
+      const double checks = (double)flatnav::g_spec_checks.load();
+      const double misses = (double)flatnav::g_spec_misses.load();
+      auto pct = [&](uint64_t v) { return misses > 0 ? 100.0 * v / misses : 0.0; };
+      if (diag)
+        printf("%-5d %-5d %9.1f %8.2f%% %8.2f%% %8.2f%% %8.2f%% %8.2f%% %9.1f\n", k, w, checks / nq,
+               checks > 0 ? 100.0 * misses / checks : 0.0,
+               checks > 0 ? 100.0 * flatnav::g_spec_floor.load() / checks : 0.0,
+               pct(flatnav::g_spec_miss_rejected.load()), pct(flatnav::g_spec_miss_tie.load()),
+               pct(flatnav::g_spec_miss_order.load()),
+               (double)flatnav::g_spec_wasted.load() / nq);
+      else
+        printf("%-5d %-5d %9.1f %8.2f%% %9.2f %9.1f %9.1f %9.2f %8.0f\n", k, w, checks / nq,
+               checks > 0 ? 100.0 * misses / checks : 0.0,
+               (double)flatnav::g_spec_discarded.load() / nq,
+               (double)flatnav::g_spec_committed.load() / nq,
+               (double)flatnav::g_spec_wasted.load() / nq,
+               (double)flatnav::g_spec_stalls.load() / nq, nq / secs);
+
+      if (diag) {
+        // How deep the pipeline was actually running when each prediction was made. A miss empties
+        // the ring, so the configured k is only a ceiling on this.
+        double tot = 0, wsum = 0;
+        for (int i = 0; i < flatnav::kSpecDepthCap; i++) {
+          const double c = (double)flatnav::g_spec_depth_checks[i].load();
+          tot += c; wsum += c * i;
+        }
+        printf("      effective depth: mean %.2f of k=%d |", tot > 0 ? wsum / tot : 0.0, k);
+        for (int i = 1; i <= k && i < flatnav::kSpecDepthCap; i++) {
+          const double c = (double)flatnav::g_spec_depth_checks[i].load();
+          if (c == 0) continue;
+          printf("  d=%d %.1f%% miss %.1f%%", i, 100.0 * c / tot,
+                 100.0 * flatnav::g_spec_depth_misses[i].load() / c);
+        }
+        printf("\n");
+      }
+
+      if (bad_res || bad_exp || bad_reads) {
+        all_ok = false;
+        printf("      FAIL k=%d w=%d: %llu result, %llu expansion-order, %llu read-count mismatches\n",
+               k, w, (unsigned long long)bad_res.load(), (unsigned long long)bad_exp.load(),
+               (unsigned long long)bad_reads.load());
+      }
+      fflush(stdout);
+    }
+  }
+
+  printf("\n# checks/q  predictions tested per query; the first pick off an empty ring is not one\n");
+  printf("# miss%%     share of predictions the validated lane did not confirm\n");
+  printf("# disc/q    speculative steps thrown away | wasted/q  their vectors\n");
+  if (diag) {
+    printf("# floor%%    share of checks whose true winner was invisible to speculation, so no\n");
+    printf("#           width recovers it -- comparable to pq_top1's `rejected` coverage column\n");
+    printf("# rej%%      predicted node never admitted to the beam: no ranking could have found it\n");
+    printf("# tie%%      admitted at the SAME distance as the node expanded; lost on heap order\n");
+    printf("# order%%    admitted at a different distance and genuinely ranked wrong\n");
+    if (oracle)
+      printf("# ORACLE + DIAG: order%% must be 0 -- the speculative lane has the exact scores\n");
+  } else {
+    printf("# qps is below exact by construction: same reads, plus PQ and discarded work\n");
+  }
+  printf("\n%s\n", all_ok ? "PASS: results, expansion order and read counts identical to exact"
+                          : "FAIL: see mismatches above");
+  return all_ok ? 0 : 1;
+}
