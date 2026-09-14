@@ -20,12 +20,27 @@
 //   DEPTHS=1,2,3,4,8                  validation depths k to sweep
 //   WIDTHS=1                          speculation widths w (only w=1 is implemented)
 //   ORACLE=0                          1 = score the speculative lane exact instead of PQ
+//   DIAG=0                            1 = classify every miss (costs a queue scan per miss)
 //   NQ=...                            cap on the number of queries
+//
+// Tiered placement + helper staging (the point of running ahead). Vectors sit on the far NUMA
+// node, graph and PQ codes on the local one; the speculative lane hands each freshly discovered
+// id to helper threads, which copy that vector far->local while speculation carries on, and
+// validation reads the local copy k slots later.
+//   VEC_NODE=-1  GRAPH_NODE=-1        NUMA nodes for vectors / graph (-1 = default allocator)
+//   PF_HELPER_CPUS=<list>             cpus to pin staging helpers to (empty = no staging)
+//   PF_BUF_SLOTS=1048576              staging buffer capacity, in vectors
+//   PF_LOCAL_NODE=0                   NUMA node holding the staging buffer
 #define FLATNAV_PQ_GATE
 #define FLATNAV_SPEC_TRACE
 #include <flatnav/distances/SquaredL2Distance.h>
 #include <flatnav/index/Index.h>
 #include <flatnav/util/Multithreading.h>
+#include <flatnav/util/NumaThreadPool.h>
+#include <flatnav/util/PrefetchStaging.h>
+
+#include <pthread.h>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -155,8 +170,11 @@ int main(int argc, char** argv) {
   int qdim; size_t nq; std::vector<float> queries = readFvecs(argv[2], qdim, nq);
   if (getenv("NQ")) nq = std::min(nq, (size_t)atoll(getenv("NQ")));
 
+  const int vec_node = getenv("VEC_NODE") ? atoi(getenv("VEC_NODE")) : flatnav::util::kNoNumaNode;
+  const int graph_node = getenv("GRAPH_NODE") ? atoi(getenv("GRAPH_NODE")) : flatnav::util::kNoNumaNode;
+
   auto t0 = clk::now();
-  auto index = Index<dist_t, int>::loadIndex(argv[1]);
+  auto index = Index<dist_t, int>::loadIndex(argv[1], vec_node, graph_node);
   const size_t N = index->currentNumNodes();
   const int dim = (int)(index->dataSizeBytes() / sizeof(float));
   if (dim % m) { fprintf(stderr, "dim %d not divisible by PQ_M %d\n", dim, m); return 1; }
@@ -203,6 +221,35 @@ int main(int argc, char** argv) {
   // Codes installed, gate window empty: beamSearch stays fully exact and is the baseline.
   index->setPQGate(codes.data(), (uint32_t)m, 0, 0);
 
+  // Staging helpers. The ring is fed by the speculative lane with the exact ids validation will
+  // read, so `_pf_k` stays 0 -- the top-K-candidate feeder that beamSearch uses is not wanted here.
+  std::vector<int> helper_cpus = flatnav::parseCpuList(getenv("PF_HELPER_CPUS"));
+  const size_t pf_slots = getenv("PF_BUF_SLOTS") ? (size_t)atoll(getenv("PF_BUF_SLOTS")) : (1u << 20);
+  const int pf_node = getenv("PF_LOCAL_NODE") ? atoi(getenv("PF_LOCAL_NODE")) : 0;
+  flatnav::StagingBuffer* pf_buf = nullptr;
+  flatnav::MPMCRing* pf_ring = nullptr;
+  std::vector<std::thread> helpers;
+  std::atomic<bool> pf_stop{false};
+  if (!helper_cpus.empty()) {
+    pf_buf = new flatnav::StagingBuffer(pf_slots, index->dataSizeBytes(), pf_node);
+    pf_ring = new flatnav::MPMCRing(1u << 16);
+    for (int cpu : helper_cpus) {
+      helpers.emplace_back([&index, pf_ring, &pf_stop, cpu]() {
+        cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
+        uint32_t id;
+        while (!pf_stop.load(std::memory_order_relaxed)) {
+          if (pf_ring->dequeue(id)) index->stageNode(id);
+          else _mm_pause();
+        }
+      });
+    }
+    printf("[stage] helpers=%zu slots=%zu buf_node=%d buf_MB=%.0f | vec_node=%d graph_node=%d\n",
+           helper_cpus.size(), pf_slots, pf_node,
+           (double)pf_slots * index->dataSizeBytes() / 1e6, vec_node, graph_node);
+    fflush(stdout);
+  }
+
   const uint32_t BLOCK = 64;
   const uint32_t nblocks = (uint32_t)((nq + BLOCK - 1) / BLOCK);
 
@@ -233,6 +280,8 @@ int main(int argc, char** argv) {
          nq, base_secs, nq / base_secs, base_steps / nq, base_rd / nq);
   fflush(stdout);
 
+  // Armed only now: the exact baseline above must not pay for staged lookups that can never hit.
+  if (pf_buf) index->setPrefetchStaging(pf_buf, pf_ring, /* k = */ 0);
   index->setSpecDiag(diag);
   if (diag)
     printf("%-5s %-5s %9s %9s %9s %9s %9s %9s %9s\n", "k", "w", "checks/q", "miss%", "floor%",
@@ -248,6 +297,7 @@ int main(int argc, char** argv) {
       flatnav::g_spec_miss_rejected = 0; flatnav::g_spec_discarded = 0;
       flatnav::g_spec_stalls = 0; flatnav::g_spec_committed = 0; flatnav::g_spec_wasted = 0;
       flatnav::g_spec_miss_tie = 0; flatnav::g_spec_miss_order = 0; flatnav::g_spec_floor = 0;
+      if (pf_buf) pf_buf->resetStats();
       for (int i = 0; i < flatnav::kSpecDepthCap; i++) {
         flatnav::g_spec_depth_checks[i] = 0;
         flatnav::g_spec_depth_misses[i] = 0;
@@ -313,6 +363,11 @@ int main(int argc, char** argv) {
         printf("\n");
       }
 
+      if (pf_buf) {
+        const double uses = (double)pf_buf->uses();
+        printf("      staged %.2f%% of validated reads (%.0f hits / %.0f)\n",
+               uses > 0 ? 100.0 * pf_buf->hits() / uses : 0.0, (double)pf_buf->hits(), uses);
+      }
       if (bad_res || bad_exp || bad_reads) {
         all_ok = false;
         printf("      FAIL k=%d w=%d: %llu result, %llu expansion-order, %llu read-count mismatches\n",
@@ -337,7 +392,15 @@ int main(int argc, char** argv) {
   } else {
     printf("# qps is below exact by construction: same reads, plus PQ and discarded work\n");
   }
-  printf("\n%s\n", all_ok ? "PASS: results, expansion order and read counts identical to exact"
-                          : "FAIL: see mismatches above");
+  if (depths.empty() || widths.empty())
+    printf("\nexact baseline only: no (k, w) configured, nothing compared\n");
+  else
+    printf("\n%s\n", all_ok ? "PASS: results, expansion order and read counts identical to exact"
+                            : "FAIL: see mismatches above");
+
+  pf_stop.store(true, std::memory_order_relaxed);
+  for (auto& h : helpers) h.join();
+  delete pf_buf;
+  delete pf_ring;
   return all_ok ? 0 : 1;
 }

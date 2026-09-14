@@ -646,6 +646,13 @@ class Index {
     _pf_k = k;
   }
 
+  // Helper thread: copy one node's vector into the staging buffer. The speculative lane knows
+  // exactly which nodes validation will read, so it enqueues those ids directly rather than a
+  // candidate whose neighbours have to be guessed at.
+  void stageNode(uint32_t node) {
+    if (_pf_buf) _pf_buf->put(node, getNodeData(node));
+  }
+
   // Helper thread: copy the vectors of `candidate`'s neighbors into the staging buffer.
   void stageNeighbors(uint32_t candidate) {
     if (!_pf_buf) return;
@@ -1802,6 +1809,10 @@ class Index {
         if (visited_set->isVisited(nbr)) continue;
         visited_set->insert(nbr);
         st.fresh.push_back(nbr);
+        // This is the whole point of running ahead: validation reads exactly these vectors k
+        // slots from now, so hand them to the helpers to copy local while speculation carries on.
+        // Lossy -- a full ring just leaves that vector to be read remote.
+        if (_pf_ring) _pf_ring->enqueue(nbr);
       }
       const bool filling = neighbors.size() < static_cast<size_t>(buffer_size);
       for (const node_id_t nbr : st.fresh) {
@@ -1900,8 +1911,14 @@ class Index {
         if (tl_spec_expand) tl_spec_expand->push_back(st.node);
 #endif
         for (const node_id_t nbr : st.fresh) {
-          const float d = _distance->distance(/* x = */ query, /* y = */ getNodeData(nbr),
-                                              /* asymmetric = */ true);
+          auto distFrom = [&](const char* v) {
+            return _distance->distance(/* x = */ query, /* y = */ v, /* asymmetric = */ true);
+          };
+          float d;
+          // Read the helpers' local copy when it landed in time, else the remote original. A
+          // pure latency hint: the value is identical either way, so results cannot move.
+          if (!(_pf_buf && _pf_buf->computeIfStaged(nbr, distFrom, d)))
+            d = distFrom(getNodeData(nbr));
           tl_spec_committed++;
           if (neighbors.size() < static_cast<size_t>(buffer_size) || d < max_dist) {
             candidates.emplace(-d, nbr);
