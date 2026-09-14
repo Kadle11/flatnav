@@ -82,8 +82,8 @@ done
 # MSR 0x620 is package-scoped, so -p only has to name any cpu on the target socket. With
 # sub-NUMA clustering the near and far NUMA nodes can share a package, and throttling the far
 # one would then slow local memory too, quietly invalidating every comparison below.
-first_cpu_of_node() { local l; l=$(< "/sys/devices/system/node/node$1/cpulist"); echo "${l%%[-,]*}"; }
-pkg_of_cpu() { < "/sys/devices/system/cpu/cpu$1/topology/physical_package_id"; }
+first_cpu_of_node() { local l; l=$(cat "/sys/devices/system/node/node$1/cpulist"); echo "${l%%[-,]*}"; }
+pkg_of_cpu() { local f="/sys/devices/system/cpu/cpu$1/topology/physical_package_id"; [ -r "$f" ] && cat "$f"; }
 for n in "$NEAR" "$FAR"; do
   [ -d "/sys/devices/system/node/node$n" ] || {
     echo "no NUMA node $n on this host. Available: $(ls -d /sys/devices/system/node/node[0-9]* | sed 's#.*/node##' | tr '\n' ' ')"
@@ -94,9 +94,15 @@ NEAR_CPU=$(first_cpu_of_node "$NEAR")
 REMOTE_CPU=${REMOTE_CPU:-$(first_cpu_of_node "$FAR")}
 NEAR_PKG=$(pkg_of_cpu "$NEAR_CPU")
 FAR_PKG=$(pkg_of_cpu "$REMOTE_CPU")
+[ -n "$NEAR_PKG" ] && [ -n "$FAR_PKG" ] || {
+  echo "cannot read physical_package_id: near node $NEAR cpu=${NEAR_CPU:-?} pkg='${NEAR_PKG}' |" \
+       "far node $FAR cpu=${REMOTE_CPU:-?} pkg='${FAR_PKG}'"
+  echo "Expected /sys/devices/system/cpu/cpu<N>/topology/physical_package_id to be readable."
+  exit 1; }
 [ "$NEAR_PKG" != "$FAR_PKG" ] || {
-  echo "node $NEAR and node $FAR are both on package $FAR_PKG (sub-NUMA clustering?)."
-  echo "Throttling the far node would slow near memory too. Set FAR= to a node on another package."
+  echo "node $NEAR (cpu $NEAR_CPU) and node $FAR (cpu $REMOTE_CPU) are both on package $FAR_PKG."
+  echo "Uncore frequency is package-scoped, so throttling the far node would slow near memory too."
+  echo "With sub-NUMA clustering the nodes of one socket share a package; pick FAR= on the other."
   exit 1; }
 
 # --- save the far package's uncore frequency, restore on any exit --------------------------
@@ -110,7 +116,8 @@ if [ -d "$DOMAIN" ]; then
   THROTTLE=driver
   ORIG_MAX_KHZ=$(< "$DOMAIN/max_freq_khz")
   ORIG_MIN_KHZ=$(< "$DOMAIN/min_freq_khz")
-  FLOOR_KHZ=$(< "$DOMAIN/initial_min_freq_khz")
+  # Not every driver version exposes the initial_* pair; fall back to the current min as the floor.
+  FLOOR_KHZ=$( [ -r "$DOMAIN/initial_min_freq_khz" ] && cat "$DOMAIN/initial_min_freq_khz" || echo "$ORIG_MIN_KHZ" )
   ORIG_MAX=$(( ORIG_MAX_KHZ / 100000 ))
   wr() { echo "$2" | sudo tee "$DOMAIN/$1" >/dev/null; }
   # min first to the floor so it can never exceed the max being written, then max, then min.
