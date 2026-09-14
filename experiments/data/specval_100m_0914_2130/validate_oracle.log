@@ -1,0 +1,27 @@
+[load] 27.0s nodes=100000000 dim=128 | PQ m=16 sub_dim=8 | queries=25000 ef=200 K=100 T=16 | ORACLE
+[train] 200000 vectors x 16 subspaces, 25 iters in 3.2s
+[encode] 100000000 nodes in 71.8s
+
+[exact] 25000 queries in 2.98s (8393 qps), mean 207.7 expansions, 4220.4 reads/query
+
+k     w      checks/q     miss%    floor%      rej%      tie%    order%  wasted/q
+1     1         206.7     0.00%     0.00%   100.00%     0.00%     0.00%       0.0
+      effective depth: mean 1.00 of k=1 |  d=1 100.0% miss 0.0%
+2     1         206.8     0.14%     0.00%     0.28%    99.72%     0.00%      12.7
+      effective depth: mean 1.99 of k=2 |  d=1 0.6% miss 0.0%  d=2 99.4% miss 0.1%
+4     1         207.1     0.18%     0.00%     1.10%    98.90%     0.00%      36.1
+      effective depth: mean 3.96 of k=4 |  d=1 0.7% miss 0.0%  d=2 0.7% miss 0.2%  d=3 0.7% miss 0.1%  d=4 98.0% miss 0.2%
+8     1         207.4     0.23%     0.00%     1.95%    98.05%     0.00%      94.5
+      effective depth: mean 7.80 of k=8 |  d=1 0.7% miss 0.0%  d=2 0.7% miss 0.2%  d=3 0.7% miss 0.1%  d=4 0.7% miss 0.2%  d=5 0.7% miss 0.2%  d=6 0.7% miss 0.2%  d=7 0.7% miss 0.2%  d=8 95.1% miss 0.2%
+
+# checks/q  predictions tested per query; the first pick off an empty ring is not one
+# miss%     share of predictions the validated lane did not confirm
+# disc/q    speculative steps thrown away | wasted/q  their vectors
+# floor%    share of checks whose true winner was invisible to speculation, so no
+#           width recovers it -- comparable to pq_top1's `rejected` coverage column
+# rej%      predicted node never admitted to the beam: no ranking could have found it
+# tie%      admitted at the SAME distance as the node expanded; lost on heap order
+# order%    admitted at a different distance and genuinely ranked wrong
+# ORACLE + DIAG: order% must be 0 -- the speculative lane has the exact scores
+
+PASS: results, expansion order and read counts identical to exact

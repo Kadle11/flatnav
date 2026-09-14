@@ -1,0 +1,23 @@
+[load] 29.9s nodes=100000000 dim=128 | PQ m=16 sub_dim=8 | queries=175000 ef=200 K=100 T=16
+[train] 200000 vectors x 16 subspaces, 25 iters in 3.3s
+[encode] 100000000 nodes in 69.5s
+
+[stage] helpers=4 slots=4194304 buf_node=0 buf_MB=2147 | vec_node=3 graph_node=0
+[exact] 175000 queries in 9.96s (17563 qps), mean 207.7 expansions, 4134.8 reads/query
+
+k     w      checks/q     miss%    disc/q   reads/q  wasted/q  stalls/q      qps
+1     1         206.7    23.89%     49.54    4134.8    1030.1      1.07      715
+      staged 99.76% of validated reads (721719022 hits / 723420152)
+2     1         206.7    26.52%    109.68    4134.8    2279.7      1.12      609
+      staged 99.73% of validated reads (721487418 hits / 723420152)
+4     1         206.6    27.36%    225.40    4134.8    4671.3      1.30      440
+      staged 99.84% of validated reads (722227413 hits / 723420152)
+8     1         206.1    27.68%    452.77    4134.8    9333.7      1.79      296
+      staged 99.84% of validated reads (722235390 hits / 723420152)
+
+# checks/q  predictions tested per query; the first pick off an empty ring is not one
+# miss%     share of predictions the validated lane did not confirm
+# disc/q    speculative steps thrown away | wasted/q  their vectors
+# qps is below exact by construction: same reads, plus PQ and discarded work
+
+PASS: results, expansion order and read counts identical to exact
