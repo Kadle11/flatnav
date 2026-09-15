@@ -22,6 +22,7 @@
 //   ORACLE=0                          1 = score the speculative lane exact instead of PQ
 //   DIAG=0                            1 = classify every miss (costs a queue scan per miss)
 //   NQ=...                            cap on the number of queries
+//   GT=<gt.ivecs>                     ground truth; adds recall@K to the exact line and each row
 //
 // Tiered placement + helper staging (the point of running ahead). Vectors sit on the far NUMA
 // node, graph and PQ codes on the local one; the speculative lane hands each freshly discovered
@@ -31,6 +32,12 @@
 //   PF_HELPER_CPUS=<list>             cpus to pin staging helpers to (empty = no staging)
 //   PF_BUF_SLOTS=1048576              staging buffer capacity, in vectors
 //   PF_LOCAL_NODE=0                   NUMA node holding the staging buffer
+//
+// Validation offload is the other way round: rather than copying vectors toward the search, it
+// runs the exact-distance half on cores pinned next to the vectors, so a step sends ~20 ids and
+// receives ~20 floats instead of ~20 vectors. Speculation, the graph and the PQ codes stay near.
+// Needs one lane per search thread; short-handed threads validate inline and are warned about.
+//   VO_CPUS=<list>                    cpus to pin validation workers to (empty = no offload)
 #define FLATNAV_PQ_GATE
 #define FLATNAV_SPEC_TRACE
 #include <flatnav/distances/SquaredL2Distance.h>
@@ -41,6 +48,7 @@
 
 #include <pthread.h>
 #include <thread>
+#include <unordered_set>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -79,6 +87,19 @@ static std::vector<float> readFvecs(const char* path, int& dim, size_t& n) {
   size_t rec = 4 + (size_t)dim * 4; n = fsize / rec;
   std::vector<float> out(n * dim);
   for (size_t i = 0; i < n; i++) memcpy(&out[i*dim], base + i*rec + 4, dim*4);
+  munmap(map, fsize); close(fd); return out;
+}
+
+static std::vector<int> readIvecs(const char* path, int& w, size_t& n) {
+  int fd = open(path, O_RDONLY); if (fd < 0) { perror("open ivecs"); exit(1); }
+  struct stat st; fstat(fd, &st); size_t fsize = st.st_size;
+  void* map = mmap(nullptr, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED) { perror("mmap ivecs"); exit(1); }
+  const char* base = static_cast<const char*>(map);
+  w = *reinterpret_cast<const int32_t*>(base);
+  size_t rec = 4 + (size_t)w * 4; n = fsize / rec;
+  std::vector<int> out(n * w);
+  for (size_t i = 0; i < n; i++) memcpy(&out[i*w], base + i*rec + 4, w*4);
   munmap(map, fsize); close(fd); return out;
 }
 
@@ -170,6 +191,26 @@ int main(int argc, char** argv) {
   int qdim; size_t nq; std::vector<float> queries = readFvecs(argv[2], qdim, nq);
   if (getenv("NQ")) nq = std::min(nq, (size_t)atoll(getenv("NQ")));
 
+  // Ground truth is optional: the pipeline's own gate is bit-exactness against the exact search,
+  // and recall is reported so a placement or offload change can be shown not to have moved it.
+  std::vector<std::unordered_set<int>> gt_topk;
+  if (const char* gt_path = getenv("GT")) {
+    int gw; size_t gn; std::vector<int> gt = readIvecs(gt_path, gw, gn);
+    if (gn < nq) { fprintf(stderr, "GT has %zu rows, need %zu\n", gn, nq); return 1; }
+    gt_topk.resize(nq);
+    for (size_t i = 0; i < nq; i++)
+      for (int j = 0; j < K && j < gw; j++) gt_topk[i].insert(gt[i * gw + j]);
+  }
+  // Fraction of each query's true top-K that `res` returned, summed over queries.
+  auto recallOf = [&](const std::vector<std::vector<std::pair<float, int>>>& res) {
+    size_t hits = 0, tot = 0;
+    for (size_t i = 0; i < nq; i++) {
+      for (const auto& pr : res[i]) if (gt_topk[i].count(pr.second)) hits++;
+      tot += std::min((size_t)K, gt_topk[i].size());
+    }
+    return tot ? (double)hits / tot : 0.0;
+  };
+
   const int vec_node = getenv("VEC_NODE") ? atoi(getenv("VEC_NODE")) : flatnav::util::kNoNumaNode;
   const int graph_node = getenv("GRAPH_NODE") ? atoi(getenv("GRAPH_NODE")) : flatnav::util::kNoNumaNode;
 
@@ -250,6 +291,31 @@ int main(int argc, char** argv) {
     fflush(stdout);
   }
 
+  // Validation offload. Workers pinned to the node holding the vectors run the exact-distance
+  // half; the search keeps links, PQ codes and the beam heaps on the near node at full clock.
+  // Needs one lane per search thread -- fewer, and the unlucky threads validate inline.
+  std::vector<int> vo_cpus = flatnav::parseCpuList(getenv("VO_CPUS"));
+  flatnav::OffloadPool* vo_pool = nullptr;
+  std::vector<std::thread> vo_workers;
+  std::atomic<bool> vo_stop{false};
+  if (!vo_cpus.empty()) {
+    if (vo_cpus.size() < (size_t)threads)
+      printf("[offload] WARNING: %zu lanes for %d search threads -- %zu will validate inline\n",
+             vo_cpus.size(), threads, threads - vo_cpus.size());
+    vo_pool = new flatnav::OffloadPool((uint32_t)vo_cpus.size(), 16);
+    for (uint32_t l = 0; l < vo_cpus.size(); l++) {
+      vo_workers.emplace_back([&index, vo_pool, &vo_stop, cpu = vo_cpus[l], l]() {
+        cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
+        while (!vo_stop.load(std::memory_order_relaxed))
+          if (!index->runValidationOffload(l)) _mm_pause();
+      });
+    }
+    printf("[offload] lanes=%zu cpus=%s | vec_node=%d graph_node=%d\n",
+           vo_cpus.size(), getenv("VO_CPUS"), vec_node, graph_node);
+    fflush(stdout);
+  }
+
   const uint32_t BLOCK = 64;
   const uint32_t nblocks = (uint32_t)((nq + BLOCK - 1) / BLOCK);
 
@@ -276,19 +342,24 @@ int main(int argc, char** argv) {
   const double base_secs = std::chrono::duration<double>(clk::now()-t3).count();
   double base_steps = 0, base_rd = 0;
   for (size_t i = 0; i < nq; i++) { base_steps += base_exp[i].size(); base_rd += base_reads[i]; }
-  printf("[exact] %zu queries in %.2fs (%.0f qps), mean %.1f expansions, %.1f reads/query\n\n",
+  printf("[exact] %zu queries in %.2fs (%.0f qps), mean %.1f expansions, %.1f reads/query",
          nq, base_secs, nq / base_secs, base_steps / nq, base_rd / nq);
+  if (!gt_topk.empty()) printf(", recall@%d=%.4f", K, recallOf(base_res));
+  printf("\n\n");
   fflush(stdout);
 
   // Armed only now: the exact baseline above must not pay for staged lookups that can never hit.
   if (pf_buf) index->setPrefetchStaging(pf_buf, pf_ring, /* k = */ 0);
+  if (vo_pool) index->setValidationOffload(vo_pool);
   index->setSpecDiag(diag);
   if (diag)
     printf("%-5s %-5s %9s %9s %9s %9s %9s %9s %9s\n", "k", "w", "checks/q", "miss%", "floor%",
            "rej%", "tie%", "order%", "wasted/q");
   else
-    printf("%-5s %-5s %9s %9s %9s %9s %9s %9s %8s\n", "k", "w", "checks/q", "miss%", "disc/q",
+    printf("%-5s %-5s %9s %9s %9s %9s %9s %9s %8s", "k", "w", "checks/q", "miss%", "disc/q",
            "reads/q", "wasted/q", "stalls/q", "qps");
+  if (!gt_topk.empty()) printf(" %8s", "recall");
+  printf("\n");
 
   bool all_ok = true;
   for (int k : depths) {
@@ -304,7 +375,7 @@ int main(int argc, char** argv) {
       }
       index->setSpecPipeline(k, w, oracle);
 
-      std::atomic<uint64_t> bad_res{0}, bad_exp{0}, bad_reads{0};
+      std::atomic<uint64_t> bad_res{0}, bad_exp{0}, bad_reads{0}, hits{0};
       auto ts = clk::now();
       flatnav::executeInParallel(0, nblocks, (uint32_t)threads, [&](uint32_t blk) {
         std::vector<float> lut((size_t)m * kCentroids);
@@ -319,6 +390,11 @@ int main(int argc, char** argv) {
           flatnav::tl_spec_expand = nullptr;
           flatnav::tl_pq_lut = nullptr;
 
+          if (!gt_topk.empty()) {
+            size_t h = 0;
+            for (const auto& pr : res) if (gt_topk[i].count(pr.second)) h++;
+            hits.fetch_add(h, std::memory_order_relaxed);
+          }
           if (res != base_res[i]) bad_res.fetch_add(1, std::memory_order_relaxed);
           if (exp != base_exp[i]) bad_exp.fetch_add(1, std::memory_order_relaxed);
           if (flatnav::tl_spec_committed != base_reads[i])
@@ -331,19 +407,25 @@ int main(int argc, char** argv) {
       const double misses = (double)flatnav::g_spec_misses.load();
       auto pct = [&](uint64_t v) { return misses > 0 ? 100.0 * v / misses : 0.0; };
       if (diag)
-        printf("%-5d %-5d %9.1f %8.2f%% %8.2f%% %8.2f%% %8.2f%% %8.2f%% %9.1f\n", k, w, checks / nq,
+        printf("%-5d %-5d %9.1f %8.2f%% %8.2f%% %8.2f%% %8.2f%% %8.2f%% %9.1f", k, w, checks / nq,
                checks > 0 ? 100.0 * misses / checks : 0.0,
                checks > 0 ? 100.0 * flatnav::g_spec_floor.load() / checks : 0.0,
                pct(flatnav::g_spec_miss_rejected.load()), pct(flatnav::g_spec_miss_tie.load()),
                pct(flatnav::g_spec_miss_order.load()),
                (double)flatnav::g_spec_wasted.load() / nq);
       else
-        printf("%-5d %-5d %9.1f %8.2f%% %9.2f %9.1f %9.1f %9.2f %8.0f\n", k, w, checks / nq,
+        printf("%-5d %-5d %9.1f %8.2f%% %9.2f %9.1f %9.1f %9.2f %8.0f", k, w, checks / nq,
                checks > 0 ? 100.0 * misses / checks : 0.0,
                (double)flatnav::g_spec_discarded.load() / nq,
                (double)flatnav::g_spec_committed.load() / nq,
                (double)flatnav::g_spec_wasted.load() / nq,
                (double)flatnav::g_spec_stalls.load() / nq, nq / secs);
+      if (!gt_topk.empty()) {
+        size_t tot = 0;
+        for (size_t i = 0; i < nq; i++) tot += std::min((size_t)K, gt_topk[i].size());
+        printf(" %8.4f", tot ? (double)hits.load() / tot : 0.0);
+      }
+      printf("\n");
 
       if (diag) {
         // How deep the pipeline was actually running when each prediction was made. A miss empties
@@ -400,7 +482,10 @@ int main(int argc, char** argv) {
 
   pf_stop.store(true, std::memory_order_relaxed);
   for (auto& h : helpers) h.join();
+  vo_stop.store(true, std::memory_order_relaxed);
+  for (auto& w : vo_workers) w.join();
   delete pf_buf;
   delete pf_ring;
+  delete vo_pool;
   return all_ok ? 0 : 1;
 }

@@ -8,6 +8,7 @@
 #include <flatnav/util/Datatype.h>
 #include <flatnav/util/NumaAllocation.h>
 #include <flatnav/util/PrefetchStaging.h>
+#include <flatnav/util/ValidationOffload.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -292,6 +293,10 @@ class Index {
     // speculation actually ran for this step: a miss empties the ring, so the steps chosen while
     // it refills see far fewer unvalidated neighbours than the configured depth allows.
     uint32_t depth_at_push = 0;
+    // Validation offload only: this step's exact distances, in `fresh` order, and the lane slot
+    // computing them. `job` is kNoJob when the distances were computed inline instead.
+    std::vector<float> dists;
+    uint32_t job = OffloadLane::kNoJob;
   };
 #endif
 
@@ -369,6 +374,7 @@ class Index {
   // ring + top-K knob. Null/0 = off. Set via setPrefetchStaging().
   StagingBuffer* _pf_buf = nullptr;
   MPMCRing* _pf_ring = nullptr;
+  OffloadPool* _vo_pool = nullptr;
   int _pf_k = 0;
 
 #ifdef FLATNAV_PQ_GATE
@@ -651,6 +657,22 @@ class Index {
   // candidate whose neighbours have to be guessed at.
   void stageNode(uint32_t node) {
     if (_pf_buf) _pf_buf->put(node, getNodeData(node));
+  }
+
+  // Validation offload. The pool's lanes are drained by threads pinned to the node holding the
+  // vectors, so the reads below are local to them and only ids and distances cross. Mutually
+  // exclusive with staging: that copies vectors toward the search, this moves the work away.
+  void setValidationOffload(OffloadPool* pool) { _vo_pool = pool; }
+
+  // Far worker thread: execute one posted batch on lane `l`, or report the lane idle.
+  bool runValidationOffload(uint32_t l) {
+    // Workers spin from construction; the pool is armed only after the exact baseline has run.
+    if (!_vo_pool) return false;
+    return _vo_pool->lane(l).runOnce([this](const OffloadJob& j) {
+      for (uint32_t i = 0; i < j.n; i++)
+        j.out[i] = _distance->distance(/* x = */ j.query, /* y = */ getNodeData(j.ids[i]),
+                                       /* asymmetric = */ true);
+    });
   }
 
   // Helper thread: copy the vectors of `candidate`'s neighbors into the staging buffer.
@@ -1789,6 +1811,10 @@ class Index {
     uint32_t head = 0, depth = 0, next_step_id = 0;
     std::vector<dist_node_t> top;  // heapTopR scratch
 
+    // One lane per search thread. A thread that finds none (more search threads than far workers)
+    // simply validates inline, so the run degrades in throughput rather than correctness.
+    OffloadLane* lane = _vo_pool ? _vo_pool->claim() : nullptr;
+
     auto slot = [&](uint32_t i) -> SpecStep& { return ring[(head + i) % ring_size]; };
     auto outstanding = [&](node_id_t n) {
       for (uint32_t i = 0; i < depth; i++)
@@ -1832,6 +1858,14 @@ class Index {
       st.inflight_lo = depth > 0 ? slot(0).id : st.id;
       st.depth_at_push = depth;
       expand(st, node);
+      // The whole point of running k ahead: these are exactly the vectors validation reads k steps
+      // from now, so the far workers can start on them while speculation carries on.
+      st.job = OffloadLane::kNoJob;
+      if (lane && !st.fresh.empty()) {
+        st.dists.resize(st.fresh.size());
+        st.job = lane->post(query, st.fresh.data(), st.dists.data(),
+                            static_cast<uint32_t>(st.fresh.size()));
+      }
       depth++;
     };
 
@@ -1841,6 +1875,13 @@ class Index {
     auto discardAll = [&]() {
       for (uint32_t i = 0; i < depth; i++) {
         SpecStep& st = slot(i);
+        // A discarded step's batch may still be running on a far core, and its slot is about to be
+        // reused. Reclaim it in post order before letting go. This wait is the pipeline flush a
+        // misprediction costs, and it belongs on the clock.
+        if (st.job != OffloadLane::kNoJob) {
+          lane->wait(st.job);
+          st.job = OffloadLane::kNoJob;
+        }
         for (const node_id_t n : st.fresh) {
           visited_set->erase(n);
           if (_spec_diag) tl_spec_origin.erase(n);
@@ -1910,15 +1951,26 @@ class Index {
 #ifdef FLATNAV_SPEC_TRACE
         if (tl_spec_expand) tl_spec_expand->push_back(st.node);
 #endif
-        for (const node_id_t nbr : st.fresh) {
+        // Offloaded: block until the far workers have this step's distances. Reaching a batch that
+        // has not landed is exactly the moment validation, not speculation, sets query latency.
+        if (st.job != OffloadLane::kNoJob) {
+          lane->wait(st.job);
+          st.job = OffloadLane::kNoJob;
+        }
+        for (size_t fi = 0; fi < st.fresh.size(); fi++) {
+          const node_id_t nbr = st.fresh[fi];
           auto distFrom = [&](const char* v) {
             return _distance->distance(/* x = */ query, /* y = */ v, /* asymmetric = */ true);
           };
           float d;
-          // Read the helpers' local copy when it landed in time, else the remote original. A
-          // pure latency hint: the value is identical either way, so results cannot move.
-          if (!(_pf_buf && _pf_buf->computeIfStaged(nbr, distFrom, d)))
+          if (lane) {
+            // Computed on a far core, in `fresh` order, so the merge below is unchanged.
+            d = st.dists[fi];
+          } else if (!(_pf_buf && _pf_buf->computeIfStaged(nbr, distFrom, d))) {
+            // Read the helpers' local copy when it landed in time, else the remote original. A
+            // pure latency hint: the value is identical either way, so results cannot move.
             d = distFrom(getNodeData(nbr));
+          }
           tl_spec_committed++;
           if (neighbors.size() < static_cast<size_t>(buffer_size) || d < max_dist) {
             candidates.emplace(-d, nbr);
