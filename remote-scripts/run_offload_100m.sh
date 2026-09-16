@@ -43,6 +43,9 @@
 # Cost note: every invocation retrains the PQ codebook and re-encodes 100M nodes (~1-2 min).
 set -euo pipefail
 
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/hwguard.sh"
+
 ROOT=${ROOT:-$HOME/vishal}
 PATHS=${PATHS:-$ROOT/.spec_paths.env}
 # shellcheck disable=SC1090
@@ -64,7 +67,9 @@ PQ_M=${PQ_M:-16}
 NEAR=${NEAR:-0}                  # graph, PQ codes, and the speculative lane
 FAR=${FAR:-1}                    # vectors, and the validation workers
 CORE_MHZ=${CORE_MHZ:-800}        # far-core clock: the near-memory compute budget
-RATIOS=${RATIOS:-24 16 8 4}      # far-node uncore ratios, 100 MHz units
+RATIOS=${RATIOS:-24 16 8}       # far-node uncore ratios, 100 MHz units. 8 is this part's
+                                 # floor; 4 was dropped because the driver clamps it to 8 and it
+                                 # silently duplicated that point in every earlier sweep.
 
 ONLY=${ONLY:-all}
 OUT=${OUT:-$ROOT/offload_100m_$(date +%m%d_%H%M)}
@@ -173,6 +178,11 @@ else
 fi
 
 # --- far-package uncore frequency: identical handling to run_specval_100m.sh ---------------
+# hwguard first: it resets any throttle a killed run leaked, so the ORIG_* captured below are
+# the hardware defaults rather than that leak, and it refuses ratios the part cannot reach.
+hwguard_uncore_init "$FAR_PKG"
+hwguard_require_ratios "$RATIOS" || exit 1
+
 UNCORE_SYS=/sys/devices/system/cpu/intel_uncore_frequency
 DOMAIN=$UNCORE_SYS/$(printf 'package_%02d_die_00' "$FAR_PKG")
 if [ -d "$DOMAIN" ]; then
@@ -188,8 +198,10 @@ if [ -d "$DOMAIN" ]; then
     wr min_freq_khz "$FLOOR_KHZ"; wr max_freq_khz "$khz"; wr min_freq_khz "$khz"
     got_max=$(< "$DOMAIN/max_freq_khz"); got_min=$(< "$DOMAIN/min_freq_khz")
     echo "[uncore] ratio=$r ($((r / 10)).$((r % 10)) GHz) -> min=$got_min max=$got_max kHz"
-    [ "$got_max" = "$khz" ] && [ "$got_min" = "$khz" ] || \
-      echo "[uncore] WARNING: asked for $khz kHz, hardware reports min=$got_min max=$got_max -- this point is NOT the ratio its filename claims"
+    # Hard failure, not a warning: a clamped ratio produces a duplicate point archived under a
+    # clock the hardware never ran, which is worse than no point at all.
+    [ "$got_max" = "$khz" ] && [ "$got_min" = "$khz" ] || {
+      echo "[uncore] ABORT: asked for $khz kHz, hardware reports min=$got_min max=$got_max"; exit 1; }
   }
 else
   THROTTLE=msr
@@ -204,13 +216,16 @@ else
     now=$(sudo rdmsr -p "$REMOTE_CPU" 0x620)
     got_max=$(( 0x$now & 0x7f )); got_min=$(( (0x$now >> 8) & 0x7f ))
     echo "[uncore] ratio=$r ($((r / 10)).$((r % 10)) GHz) MSR=0x$now max=$got_max min=$got_min"
-    [ "$got_max" = "$r" ] && [ "$got_min" = "$r" ] || \
-      echo "[uncore] WARNING: asked for $r, hardware reports max=$got_max min=$got_min -- this point is NOT the ratio its filename claims"
+    [ "$got_max" = "$r" ] && [ "$got_min" = "$r" ] || {
+      echo "[uncore] ABORT: asked for $r, hardware reports max=$got_max min=$got_min"; exit 1; }
   }
 fi
 
-restore() { restore_cores; restore_uncore; }
+restore() { restore_cores; restore_uncore; hwguard_restore_all; }
 trap restore EXIT
+
+hwguard_numa_balancing_off
+hwguard_record_config "$OUT/config_proof.txt"
 
 if [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ] || [ "$REPO/include/flatnav/index/Index.h" -nt "$BIN" ] \
    || [ "$REPO/include/flatnav/util/ValidationOffload.h" -nt "$BIN" ]; then
@@ -261,14 +276,6 @@ for r in $RATIOS; do
         VEC_NODE="$FAR" GRAPH_NODE="$NEAR" VO_CPUS="$VO_CPUS" \
         "${PIN[@]}" "$BIN" "$IDX" "$Q" "$T" "$EF" "$K"
   fi
-  # Same total core count as offload (near threads + far lanes), but no pipeline: exact search,
-  # far vectors, threads scheduled across both sockets doing the inline distance work themselves.
-  # Isolates whether offload's edge is the byte-cut or just the extra cores.
-  if want dualsocket; then
-    run "dualsocket_r$r" env NQ="$NQ" DEPTHS="" PQ_M="$PQ_M" GT="$GT" \
-        VEC_NODE="$FAR" GRAPH_NODE="$NEAR" \
-        "${DUAL_PIN[@]}" "$BIN" "$IDX" "$Q" "$DUAL_T" "$EF" "$K"
-  fi
 done
 
 # --- summary -------------------------------------------------------------------------------
@@ -285,13 +292,6 @@ echo "-- exact baseline: near, then far at each uncore ratio --"
 for r in $RATIOS; do
   [ -s "$OUT/baseline_far_r$r.log" ] || continue
   printf '%-18s %s\n' "far r=$r" "$(grep '^\[exact\]' "$OUT/baseline_far_r$r.log")"
-done
-
-echo
-echo "-- dualsocket control: exact search, far vectors, T=$DUAL_T threads across both sockets --"
-for r in $RATIOS; do
-  [ -s "$OUT/dualsocket_r$r.log" ] || continue
-  printf '%-18s %s\n' "dualsocket r=$r" "$(grep '^\[exact\]' "$OUT/dualsocket_r$r.log")"
 done
 
 echo

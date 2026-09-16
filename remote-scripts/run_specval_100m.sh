@@ -41,6 +41,9 @@
 # comparable regardless.
 set -euo pipefail
 
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/hwguard.sh"
+
 ROOT=${ROOT:-$HOME/vishal}
 PATHS=${PATHS:-$ROOT/.spec_paths.env}
 # shellcheck disable=SC1090
@@ -64,7 +67,9 @@ NEAR=${NEAR:-0}                  # graph, PQ codes, staging buffer, and all cpus
 FAR=${FAR:-1}                    # vectors
 HELPER_CPUS=${HELPER_CPUS:-92,93,94,95}   # node-0 cpus for the staging helpers
 BUF_SLOTS=${BUF_SLOTS:-4194304}           # staging capacity in vectors (~2 GB at 512 B)
-RATIOS=${RATIOS:-24 16 8 4}               # far-node uncore ratios, 100 MHz units
+RATIOS=${RATIOS:-24 16 8}                 # far-node uncore ratios, 100 MHz units. 8 is this part's
+                                          # floor; 4 was dropped -- the driver clamps it to 8, so it
+                                          # silently duplicated that point in every earlier sweep.
 
 ONLY=${ONLY:-all}
 OUT=${OUT:-$ROOT/specval_100m_$(date +%m%d_%H%M)}
@@ -107,6 +112,12 @@ FAR_PKG=$(pkg_of_cpu "$REMOTE_CPU")
 # Both paths pin min = max so the far uncore cannot ramp back up mid-run, and both verify by
 # read-back: a silently clamped write would file a run under a latency it never ran at, which is
 # worse than failing because it still looks like data.
+# hwguard first: it resets any throttle a killed run leaked, so the ORIG_* captured below are
+# the hardware defaults rather than that leak, and it rejects ratios below the floor as well as
+# above the ceiling -- the loop further down only ever checked the ceiling.
+hwguard_uncore_init "$FAR_PKG"
+hwguard_require_ratios "$RATIOS" || exit 1
+
 UNCORE_SYS=/sys/devices/system/cpu/intel_uncore_frequency
 DOMAIN=$UNCORE_SYS/$(printf 'package_%02d_die_00' "$FAR_PKG")
 
@@ -126,8 +137,10 @@ if [ -d "$DOMAIN" ]; then
     wr min_freq_khz "$FLOOR_KHZ"; wr max_freq_khz "$khz"; wr min_freq_khz "$khz"
     got_max=$(< "$DOMAIN/max_freq_khz"); got_min=$(< "$DOMAIN/min_freq_khz")
     echo "[uncore] ratio=$r ($((r / 10)).$((r % 10)) GHz) -> min=$got_min max=$got_max kHz"
-    [ "$got_max" = "$khz" ] && [ "$got_min" = "$khz" ] || \
-      echo "[uncore] WARNING: asked for $khz kHz, hardware reports min=$got_min max=$got_max -- this point is NOT the ratio its filename claims"
+    # Hard failure, not a warning: a clamped ratio produces a duplicate point archived under a
+    # clock the hardware never ran, which is worse than no point at all.
+    [ "$got_max" = "$khz" ] && [ "$got_min" = "$khz" ] || {
+      echo "[uncore] ABORT: asked for $khz kHz, hardware reports min=$got_min max=$got_max"; exit 1; }
   }
 else
   THROTTLE=msr
@@ -143,11 +156,15 @@ else
     now=$(sudo rdmsr -p "$REMOTE_CPU" "$MSR")
     got_max=$(( 0x$now & 0x7f )); got_min=$(( (0x$now >> 8) & 0x7f ))
     echo "[uncore] ratio=$r ($((r / 10)).$((r % 10)) GHz) MSR=0x$now max=$got_max min=$got_min"
-    [ "$got_max" = "$r" ] && [ "$got_min" = "$r" ] || \
-      echo "[uncore] WARNING: asked for $r, hardware reports max=$got_max min=$got_min -- this point is NOT the ratio its filename claims"
+    [ "$got_max" = "$r" ] && [ "$got_min" = "$r" ] || {
+      echo "[uncore] ABORT: asked for $r, hardware reports max=$got_max min=$got_min"; exit 1; }
   }
 fi
-trap restore EXIT
+restore_all() { restore; hwguard_restore_all; }
+trap restore_all EXIT
+
+hwguard_numa_balancing_off
+hwguard_record_config "$OUT/config_proof.txt"
 
 echo "[uncore] path=$THROTTLE domain=package $FAR_PKG | unthrottled max ratio = $ORIG_MAX ($((ORIG_MAX / 10)).$((ORIG_MAX % 10)) GHz)"
 for r in $RATIOS; do

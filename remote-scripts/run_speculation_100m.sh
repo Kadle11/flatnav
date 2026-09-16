@@ -19,6 +19,9 @@
 # (cpus 32-63,96-127) is the far node for later latency work.
 set -euo pipefail
 
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/hwguard.sh"
+
 ROOT=${ROOT:-$HOME/vishal}
 PATHS=${PATHS:-$ROOT/.spec_paths.env}
 # shellcheck disable=SC1090
@@ -44,6 +47,10 @@ for v in IDX Q GT; do
   [ -n "$p" ] && [ -s "$p" ] || { echo "missing $v (${p:-unset}) -- run ./setup_100m.sh, or set $v="; exit 1; }
 done
 for b in "$TOP1" "$MARGIN"; do [ -x "$b" ] || { echo "missing $b -- run ./setup_100m.sh"; exit 1; }; done
+
+trap hwguard_restore_all EXIT
+hwguard_numa_balancing_off
+hwguard_record_config "$OUT/config_proof.txt"
 
 PIN=(numactl --cpunodebind="$CPUNODE" --membind="$MEMNODE")
 run() { local tag=$1; shift; echo "[run] $tag"; "$@" > "$OUT/$tag.log" 2>&1 || { echo "  FAILED (see $OUT/$tag.log)"; return 1; }; }

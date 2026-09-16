@@ -20,6 +20,9 @@
 # verified by read-back. Needs passwordless sudo, plus msr-tools when falling back to the MSR path.
 set -euo pipefail
 
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/hwguard.sh"
+
 ROOT=${ROOT:-$HOME/vishal}
 REPO=${REPO:-$([ -d "$ROOT/flatnav" ] && echo "$ROOT/flatnav" || echo "$HOME/flatnav")}
 BIN=${BIN:-$HOME/mlp_probe_bench}
@@ -32,7 +35,8 @@ K=${K:-12}                                     # per-core MLP-saturation point f
 PFL=${PFL:-1}
 T=${T:-16}                                     # 1/phys-core, isolates from SMT (mlp_probe.sh convention)
 DUR=${DUR:-5}
-RATIOS=${RATIOS:-24 16 8 4}                    # 100 MHz units, same convention as run_specval_100m.sh
+RATIOS=${RATIOS:-24 16 8}                      # 100 MHz units, same convention as run_specval_100m.sh.
+                                               # 4 dropped: below this part's 800 MHz uncore floor.
 
 OUT=${OUT:-$ROOT/roofline_bw_$(date +%m%d_%H%M)}
 mkdir -p "$OUT"
@@ -49,6 +53,11 @@ PKG=$(pkg_of_cpu "$CPU")
 [ -n "$PKG" ] || { echo "cannot read physical_package_id for node $NODE cpu $CPU"; exit 1; }
 
 # --- uncore throttle: identical handling to run_specval_100m.sh / run_offload_100m.sh ------
+# hwguard first: it resets any throttle a killed run leaked, so the ORIG_* captured below are the
+# hardware defaults rather than that leak, and it refuses ratios the part cannot actually reach.
+hwguard_uncore_init "$PKG"
+hwguard_require_ratios "$RATIOS" || exit 1
+
 UNCORE_SYS=/sys/devices/system/cpu/intel_uncore_frequency
 DOMAIN=$UNCORE_SYS/$(printf 'package_%02d_die_00' "$PKG")
 if [ -d "$DOMAIN" ]; then
@@ -63,8 +72,10 @@ if [ -d "$DOMAIN" ]; then
     wr min_freq_khz "$FLOOR_KHZ"; wr max_freq_khz "$khz"; wr min_freq_khz "$khz"
     got_max=$(< "$DOMAIN/max_freq_khz"); got_min=$(< "$DOMAIN/min_freq_khz")
     echo "[uncore] ratio=$r ($((r / 10)).$((r % 10)) GHz) -> min=$got_min max=$got_max kHz"
-    [ "$got_max" = "$khz" ] && [ "$got_min" = "$khz" ] || \
-      echo "[uncore] WARNING: asked for $khz kHz, hardware reports min=$got_min max=$got_max -- this point is NOT the ratio its filename claims"
+    # Hard failure, not a warning: a clamped ratio produces a duplicate point archived under a
+    # clock the hardware never ran, which is worse than no point at all.
+    [ "$got_max" = "$khz" ] && [ "$got_min" = "$khz" ] || {
+      echo "[uncore] ABORT: asked for $khz kHz, hardware reports min=$got_min max=$got_max"; exit 1; }
   }
 else
   THROTTLE=msr
@@ -78,11 +89,15 @@ else
     now=$(sudo rdmsr -p "$CPU" 0x620)
     got_max=$(( 0x$now & 0x7f )); got_min=$(( (0x$now >> 8) & 0x7f ))
     echo "[uncore] ratio=$r ($((r / 10)).$((r % 10)) GHz) MSR=0x$now max=$got_max min=$got_min"
-    [ "$got_max" = "$r" ] && [ "$got_min" = "$r" ] || \
-      echo "[uncore] WARNING: asked for ratio $r, hardware reports max=$got_max min=$got_min -- this point is NOT the ratio its filename claims"
+    [ "$got_max" = "$r" ] && [ "$got_min" = "$r" ] || {
+      echo "[uncore] ABORT: asked for ratio $r, hardware reports max=$got_max min=$got_min"; exit 1; }
   }
 fi
-trap restore_uncore EXIT
+restore_all() { restore_uncore; hwguard_restore_all; }
+trap restore_all EXIT
+
+hwguard_numa_balancing_off
+hwguard_record_config "$OUT/config_proof.txt"
 
 if [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ]; then
   echo "[build] g++ -O3 -march=native -DFLATNAV_USE_NUMA mlp_probe.cpp"
