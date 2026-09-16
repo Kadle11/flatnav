@@ -1,0 +1,14 @@
+[load] 28.0s nodes=100000000 dim=128 | PQ m=16 sub_dim=8 | queries=200000 ef=200 K=100 T=32
+[train] 200000 vectors x 16 subspaces, 25 iters in 5.0s
+[encode] 100000000 nodes in 50.2s
+
+[exact] 200000 queries in 7.71s (25937 qps), mean 207.5 expansions, 4117.9 reads/query, recall@100=0.8752
+
+k     w      checks/q     miss%    disc/q   reads/q  wasted/q  stalls/q      qps   recall
+
+# checks/q  predictions tested per query; the first pick off an empty ring is not one
+# miss%     share of predictions the validated lane did not confirm
+# disc/q    speculative steps thrown away | wasted/q  their vectors
+# qps is below exact by construction: same reads, plus PQ and discarded work
+
+exact baseline only: no (k, w) configured, nothing compared
