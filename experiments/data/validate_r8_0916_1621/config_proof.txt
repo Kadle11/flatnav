@@ -1,0 +1,39 @@
+=== validate_offload_r8 config proof ===
+host=solab-s6  date=2026-09-16T16:21:42-07:00  kernel=6.6.0-rc6-128gb-full-sharing
+idx=/home/labuser/vishal/index/sift100m_flatnav.bin
+q=/home/labuser/vishal/flatnav/SIFT-200K/sift100m_200k_extra_query.fvecs gt=/home/labuser/vishal/flatnav/SIFT-200K/sift100m_200k_extra_query.gtruth.ivecs nq=200000 ef=200 K=100 T=32 depths=1
+near=node0 (pkg 0)  far=node1 (pkg 1)  lanes=32
+vo_cpus=32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
+
+--- free memory per node (vectors need ~51 GB on the vector node; a silent fallback
+--- to the other node would invalidate every placement in this run) ---
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95
+node 0 size: 257663 MB
+node 0 free: 155429 MB
+node 1 cpus: 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127
+node 1 size: 257991 MB
+node 1 free: 193771 MB
+node distances:
+node   0   1 
+  0:  10  21 
+  1:  21  10 
+
+--- turbo / pstate ---
+/sys/devices/system/cpu/cpufreq/boost = 1
+scaling_driver=acpi-cpufreq
+scaling_governor=schedutil
+
+--- transparent hugepages ---
+always [madvise] never
+numa_balancing (before) = 0
+[hwguard] numa_balancing already 0
+[hwguard] uncore pkg1 hardware range 800000-2400000 kHz (ratio 8..24)
+[uncore] domain=/sys/devices/system/cpu/intel_uncore_frequency/package_01_die_00
+[uncore] hardware range: min=800000 max=2400000 kHz (= ratio 8..24)
+[uncore] as found:       min=800000 max=2400000 kHz
+[cfg] throttle=driver core_path=driver
+[perf] upi_event_kind=raw
+[perf] events=uncore_imc_0/cas_count_read/,uncore_imc_0/cas_count_write/,uncore_imc_1/cas_count_read/,uncore_imc_1/cas_count_write/,uncore_imc_2/cas_count_read/,uncore_imc_2/cas_count_write/,uncore_imc_3/cas_count_read/,uncore_imc_3/cas_count_write/,uncore_imc_4/cas_count_read/,uncore_imc_4/cas_count_write/,uncore_imc_5/cas_count_read/,uncore_imc_5/cas_count_write/,uncore_imc_6/cas_count_read/,uncore_imc_6/cas_count_write/,uncore_imc_7/cas_count_read/,uncore_imc_7/cas_count_write/,uncore_upi_0/event=0x02,umask=0x0f/,uncore_upi_1/event=0x02,umask=0x0f/,uncore_upi_2/event=0x02,umask=0x0f/
+[core] far cpus -> 800 MHz (cpu32 readback max=800000 kHz)
+[uncore] ratio=8 asked=800000 kHz -> readback min=800000 max=800000 kHz
