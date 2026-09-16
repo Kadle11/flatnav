@@ -4,7 +4,7 @@
 # (tools/spec_search.cpp, VO_CPUS=). Paths come from setup_100m.sh (via $ROOT/.spec_paths.env).
 #
 #   ./run_offload_100m.sh                    # all sections, full ratio sweep
-#   ONLY=offload ./run_offload_100m.sh       # one section: baseline|offload
+#   ONLY=offload ./run_offload_100m.sh       # one section: baseline|offload|dualsocket
 #   RATIOS="8" ./run_offload_100m.sh         # a single far-memory latency point
 #   CORE_MHZ=1500 ./run_offload_100m.sh      # a different far-core clock
 #
@@ -24,10 +24,15 @@
 # lane must run at full clock or the comparison means nothing.
 #
 # Sections
-#   baseline  exact search, no speculation, no offload. Near-only once, then far vectors per
-#             ratio with the search on near cores -- today's placement, the number to beat.
-#   offload   the pipeline with VO_CPUS set to the far node's cpus, per ratio. Validation runs
-#             on throttled far cores; speculation, graph and PQ codes stay near and unthrottled.
+#   baseline    exact search, no speculation, no offload. Near-only once, then far vectors per
+#               ratio with the search on near cores -- today's placement, the number to beat.
+#   offload     the pipeline with VO_CPUS set to the far node's cpus, per ratio. Validation runs
+#               on throttled far cores; speculation, graph and PQ codes stay near and unthrottled.
+#   dualsocket  control for offload's extra cores: exact search again (no speculation, no
+#               pipeline, no offload pool), far vectors, but threads span BOTH sockets --
+#               DUAL_T = T + far lanes, same total core count offload gets. If this matches
+#               offload's per-ratio qps, offload's win is just added parallelism, not the
+#               byte-cut it's meant to test; if it falls well short, the byte-cut is doing work.
 #
 # Lane count must be >= search threads or the short-handed threads validate inline and the run
 # silently measures something else; the tool warns, and T defaults to the far node's cpu count.
@@ -217,6 +222,8 @@ if [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ] || [ "$REPO/include/flatnav/index/In
 fi
 
 PIN=(numactl --cpunodebind="$NEAR")
+DUAL_T=${DUAL_T:-$((T + NLANES))}
+DUAL_PIN=(numactl --cpunodebind="$NEAR,$FAR")
 run() { local tag=$1; shift; echo "[run] $tag"; "$@" > "$OUT/$tag.log" 2>&1 || echo "  FAILED (see $OUT/$tag.log)"; }
 want() { [ "$ONLY" = all ] || [ "$ONLY" = "$1" ]; }
 
@@ -224,6 +231,7 @@ echo "[cfg] idx=$IDX"
 echo "[cfg] q=$Q gt=${GT:-none} nq=$NQ ef=$EF K=$K threads=$T depths=$DEPTHS"
 echo "[cfg] near=$NEAR (pkg $NEAR_PKG, full clock) far=$FAR (pkg $FAR_PKG) core=${CORE_MHZ}MHz via $CORE_PATH"
 echo "[cfg] lanes=$NLANES cpus=$VO_CPUS | uncore ratios=$RATIOS via $THROTTLE -> $OUT"
+echo "[cfg] dualsocket T=$DUAL_T (=$T near + $NLANES far) pinned to nodes $NEAR,$FAR"
 
 set_cores
 
@@ -253,6 +261,14 @@ for r in $RATIOS; do
         VEC_NODE="$FAR" GRAPH_NODE="$NEAR" VO_CPUS="$VO_CPUS" \
         "${PIN[@]}" "$BIN" "$IDX" "$Q" "$T" "$EF" "$K"
   fi
+  # Same total core count as offload (near threads + far lanes), but no pipeline: exact search,
+  # far vectors, threads scheduled across both sockets doing the inline distance work themselves.
+  # Isolates whether offload's edge is the byte-cut or just the extra cores.
+  if want dualsocket; then
+    run "dualsocket_r$r" env NQ="$NQ" DEPTHS="" PQ_M="$PQ_M" GT="$GT" \
+        VEC_NODE="$FAR" GRAPH_NODE="$NEAR" \
+        "${DUAL_PIN[@]}" "$BIN" "$IDX" "$Q" "$DUAL_T" "$EF" "$K"
+  fi
 done
 
 # --- summary -------------------------------------------------------------------------------
@@ -269,6 +285,13 @@ echo "-- exact baseline: near, then far at each uncore ratio --"
 for r in $RATIOS; do
   [ -s "$OUT/baseline_far_r$r.log" ] || continue
   printf '%-18s %s\n' "far r=$r" "$(grep '^\[exact\]' "$OUT/baseline_far_r$r.log")"
+done
+
+echo
+echo "-- dualsocket control: exact search, far vectors, T=$DUAL_T threads across both sockets --"
+for r in $RATIOS; do
+  [ -s "$OUT/dualsocket_r$r.log" ] || continue
+  printf '%-18s %s\n' "dualsocket r=$r" "$(grep '^\[exact\]' "$OUT/dualsocket_r$r.log")"
 done
 
 echo
