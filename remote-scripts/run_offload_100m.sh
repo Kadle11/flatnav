@@ -60,7 +60,7 @@ SRC=$REPO/tools/spec_search.cpp
 
 EF=${EF:-200}
 K=${K:-100}
-NQ=${NQ:-20000}
+NQ=${NQ:-200000}                 # short rows are mostly warm-up; 20000 gave <1 s per row
 DEPTHS=${DEPTHS:-1,2,4,8}
 PQ_M=${PQ_M:-16}
 

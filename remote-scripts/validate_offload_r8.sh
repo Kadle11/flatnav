@@ -142,7 +142,8 @@ T=${T:-$NLANES}
 # AutoNUMA. It cannot move the index (numa_alloc_onnode binds MPOL_BIND) but it can migrate the
 # PQ codes and query arrays, and it can migrate threads across sockets in any multi-node pinning.
 say "numa_balancing (before) = $(cat /proc/sys/kernel/numa_balancing 2>/dev/null || echo unavailable)"
-hwguard_numa_balancing_off | tee -a "$PROOF"
+# Not piped: a pipeline runs the function in a subshell and drops the state restore needs.
+hwguard_numa_balancing_off > >(tee -a "$PROOF")
 restore_nb() { hwguard_restore_all; }
 
 # --- far-core clock --------------------------------------------------------------------------
@@ -188,8 +189,8 @@ fi
 
 # --- far-uncore ratio, with the floor on record ----------------------------------------------
 # hwguard resets a leaked throttle before ORIG_* is captured, and refuses an out-of-range ratio.
-hwguard_uncore_init "$FAR_PKG" | tee -a "$PROOF"
-hwguard_require_ratios "$RATIO" | tee -a "$PROOF" || exit 1
+hwguard_uncore_init "$FAR_PKG" > >(tee -a "$PROOF")
+hwguard_require_ratios "$RATIO" > >(tee -a "$PROOF") || exit 1
 
 UNCORE_SYS=/sys/devices/system/cpu/intel_uncore_frequency
 DOMAIN=$UNCORE_SYS/$(printf 'package_%02d_die_00' "$FAR_PKG")
@@ -285,7 +286,7 @@ sample_numa() {  # $1=pid $2=outfile -- per-node resident bytes, honouring mixed
     { printf '%s ' "$(date +%s.%N)"
       sudo awk '{ ps=4; for(i=1;i<=NF;i++) if($i ~ /^kernelpagesize_kB=/){split($i,k,"="); ps=k[2]}
                   for(i=1;i<=NF;i++) if($i ~ /^N[0-9]+=/){split($i,a,"="); n=substr(a[1],2); kb[n]+=a[2]*ps} }
-                END{ for(n in kb) printf "node%s=%.2fGB ", n, kb[n]/1048576 }' "/proc/$pid/numa_maps"
+                END{ for(n in kb) printf "node%s=%.2fGiB ", n, kb[n]/1048576 }' "/proc/$pid/numa_maps"
       echo
     } >> "$out" 2>/dev/null || true
     sleep 5
@@ -364,7 +365,9 @@ report() {
         }
         printf "  %-6s %5.2fs | UPI tx", label, dur
         for (i=0; i<8; i++) { s="S" i; if (s in ub) printf " %s=%.1fGB", s, ub[s]/1e9 }
-        printf " = %7.0f B/query | DRAM", tot/nq
+        # The guard trims both window edges, so only (hi-lo)/dur of the queries fall inside it.
+        wq = nq * (hi - lo) / dur
+        printf " = %7.0f B/query | DRAM", tot/wq
         for (i=0; i<8; i++) { s="S" i
           if (s in imcr) printf " %s rd=%.1fGB wr=%.1fGB", s, imcr[s]/1e9, imcw[s]/1e9
         }

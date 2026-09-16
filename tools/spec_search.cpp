@@ -369,6 +369,7 @@ int main(int argc, char** argv) {
       flatnav::g_spec_stalls = 0; flatnav::g_spec_committed = 0; flatnav::g_spec_wasted = 0;
       flatnav::g_spec_miss_tie = 0; flatnav::g_spec_miss_order = 0; flatnav::g_spec_floor = 0;
       if (pf_buf) pf_buf->resetStats();
+      if (vo_pool) vo_pool->resetClaims();  // each row runs on fresh threads
       for (int i = 0; i < flatnav::kSpecDepthCap; i++) {
         flatnav::g_spec_depth_checks[i] = 0;
         flatnav::g_spec_depth_misses[i] = 0;
@@ -449,6 +450,13 @@ int main(int argc, char** argv) {
         const double uses = (double)pf_buf->uses();
         printf("      staged %.2f%% of validated reads (%.0f hits / %.0f)\n",
                uses > 0 ? 100.0 * pf_buf->hits() / uses : 0.0, (double)pf_buf->hits(), uses);
+      }
+      // Results stay bit-exact when a thread validates inline, but the row no longer measures
+      // offload, so it fails rather than being filed as an offload number.
+      if (vo_pool && vo_pool->inlineSearches() > 0) {
+        all_ok = false;
+        printf("      FAIL k=%d w=%d: %llu of %zu searches found no offload lane and validated inline\n",
+               k, w, (unsigned long long)vo_pool->inlineSearches(), nq);
       }
       if (bad_res || bad_exp || bad_reads) {
         all_ok = false;

@@ -104,12 +104,26 @@ class OffloadPool {
   // The calling search thread's lane, or nullptr when every lane is already taken.
   OffloadLane* claim() {
     thread_local int id = _next.fetch_add(1, std::memory_order_relaxed);
-    return id < static_cast<int>(_lanes.size()) ? _lanes[id] : nullptr;
+    if (id < static_cast<int>(_lanes.size())) return _lanes[id];
+    _inline.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
   }
+
+  // Call before each fresh set of search threads. Ids are cached per thread and the counter
+  // otherwise only grows, so a second batch of threads would find every lane taken and silently
+  // validate inline.
+  void resetClaims() {
+    _next.store(0, std::memory_order_relaxed);
+    _inline.store(0, std::memory_order_relaxed);
+  }
+
+  // Searches since the last reset that found no lane and validated inline.
+  uint64_t inlineSearches() const { return _inline.load(std::memory_order_relaxed); }
 
  private:
   std::vector<OffloadLane*> _lanes;
   std::atomic<int> _next{0};
+  std::atomic<uint64_t> _inline{0};
 };
 
 }  // namespace flatnav
