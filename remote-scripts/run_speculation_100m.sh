@@ -14,9 +14,9 @@
 #   gate   pq_top1 with the compression-error gate at 25% and 35% (the random-gate control)
 #   margin pq_margin (M15): offline detector curve + online recall/reads frontier
 #
-# Pinned to NUMA0 (cpus 0-15,64-79; 128 GB) of the quad-socket Xeon Gold 6530. These tools
-# measure decisions, not placement, so the pinning only keeps timings comparable; NUMA3
-# (cpus 48-63,112-127) is the far node for later latency work.
+# Pinned to node 0 (cpus 0-31,64-95; ~258 GB) of the dual-socket, 2-NUMA-node node. These tools
+# measure decisions, not placement, so the pinning only keeps timings comparable; node 1
+# (cpus 32-63,96-127) is the far node for later latency work.
 set -euo pipefail
 
 ROOT=${ROOT:-$HOME/vishal}
@@ -29,7 +29,7 @@ Q=${Q:-}
 GT=${GT:-}
 TOP1=${TOP1:-$HOME/pq_top1_bench}
 MARGIN=${MARGIN:-$HOME/pq_margin_bench}
-T=${T:-32}                  # node 0 has 32 logical cpus (16 cores x 2 HT)
+T=${T:-64}                  # node 0 has 64 logical cpus (32 cores x 2 HT)
 EF=${EF:-200}
 K=${K:-100}
 NQ=${NQ:-20000}             # the per-step replay is the cost here, not the search

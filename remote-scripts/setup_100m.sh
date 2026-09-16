@@ -9,9 +9,10 @@
 #   IDX=/path/idx.bin ./setup_100m.sh  # or name any file explicitly
 #   SKIP_INDEX=1 ./setup_100m.sh       # tools only
 #
-# Node: quad-socket Xeon Gold 6530. Experiments run on NUMA0 (cpus 0-15,64-79; 128 GB); NUMA3
-# (cpus 48-63,112-127; 128 GB) is the far node kept for later latency work. The index is ~60 GB
-# and is read into one node's memory, so it must fit in that node's 128 GB.
+# Node: dual-socket, 2 NUMA nodes (one per package, no sub-NUMA clustering). Experiments run
+# on node 0 (cpus 0-31,64-95; ~258 GB); node 1 (cpus 32-63,96-127; ~258 GB) is the far node kept
+# for later latency work. The index is ~60 GB and is read into one node's memory, so it must fit
+# in that node's ~258 GB.
 set -euo pipefail
 
 ROOT=${ROOT:-$HOME/vishal}
@@ -23,7 +24,7 @@ DEPTH=${DEPTH:-4}                        # how deep under $ROOT to search
 
 # Regenerating the HNSW base-layer graph (BUILD_MTX=1): hours, ~116 GB RAM (hnswlib keeps its
 # own copy of the vectors) and ~41 GB of disk for the text .mtx. Deliberately NOT pinned to one
-# NUMA node -- it needs more than node 0's 128 GB.
+# NUMA node (left as-is even though ~116 GB now fits in one node's ~258 GB).
 BUILD_MTX=${BUILD_MTX:-0}
 PY=${PY:-poetry run python}              # the extended hnswlib wheel lives in the poetry env
 EFC=${EFC:-200}                          # ef_construction for the HNSW build
@@ -52,7 +53,7 @@ locate() {
 }
 
 say "host $(hostname) | $(nproc) cpus | root $ROOT | repo $REPO"
-numactl -H | grep -E "^node (0|3) (cpus|size|free)" || true
+numactl -H | grep -E "^node (0|1) (cpus|size|free)" || true
 [ -d "$ROOT" ] || { say "no such root: $ROOT"; exit 1; }
 [ -d "$REPO/include/flatnav" ] || { say "no flatnav checkout at $REPO (set REPO=)"; exit 1; }
 
@@ -131,6 +132,6 @@ build_tool pq_margin.cpp pq_margin_bench
 say "ready:"
 printf '  %-10s %s\n' index "${IDX:-<skipped>}" queries "$Q" gtruth "$GT" \
                       pq_top1 "$HOME/pq_top1_bench" pq_margin "$HOME/pq_margin_bench" paths "$PATHS"
-say "node 0 memory (index needs ~60 GB + ~6 GB working set):"
+say "node 0 memory (index needs ~60 GB + ~6 GB working set, node has ~258 GB):"
 numactl -H | grep -E "^node 0 (size|free)"
 say "next: ./run_speculation_100m.sh"

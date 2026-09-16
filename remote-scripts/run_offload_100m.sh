@@ -57,7 +57,7 @@ DEPTHS=${DEPTHS:-1,2,4,8}
 PQ_M=${PQ_M:-16}
 
 NEAR=${NEAR:-0}                  # graph, PQ codes, and the speculative lane
-FAR=${FAR:-3}                    # vectors, and the validation workers
+FAR=${FAR:-1}                    # vectors, and the validation workers
 CORE_MHZ=${CORE_MHZ:-800}        # far-core clock: the near-memory compute budget
 RATIOS=${RATIOS:-24 16 8 4}      # far-node uncore ratios, 100 MHz units
 
@@ -73,7 +73,7 @@ done
 [ -n "$GT" ] && [ -s "$GT" ] || echo "[warn] no GT (${GT:-unset}) -- recall will not be reported"
 
 # --- topology: far cpus, and the package check the uncore knob demands --------------------
-expand_cpulist() {  # "48-63,112-127" -> "48 49 ... 127"
+expand_cpulist() {  # "32-63,96-127" -> "32 33 ... 127"
   local out="" part lo hi
   IFS=, read -ra parts <<< "$1"
   for part in "${parts[@]}"; do

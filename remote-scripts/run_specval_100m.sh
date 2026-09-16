@@ -20,15 +20,13 @@
 #             with helpers adds what it BUYS (far->near copies issued k steps early). A win
 #             cannot be attributed to either without all three points at the same ratio.
 #
-# Placement: dual-socket Xeon Gold 6530 with sub-NUMA clustering, so four NUMA nodes over two
-# packages -- nodes 0,1 are the SNC halves of package 0 and nodes 2,3 of package 1. Near node 0
-# (cpus 0-15,64-79; 128 GB) holds the graph, the PQ codes and the staging buffer; far node 3
-# (cpus 48-63,112-127) holds the vectors. The index is ~60 GB, so each half fits its node. The
-# process is pinned to node 0's cpus, so only vector reads cross the interconnect.
+# Placement: dual-socket node, one NUMA node per package (no sub-NUMA clustering). Near node 0
+# (cpus 0-31,64-95; ~258 GB) holds the graph, the PQ codes and the staging buffer; far node 1
+# (cpus 32-63,96-127; ~258 GB) holds the vectors. The index is ~60 GB, so each half fits its node.
+# The process is pinned to node 0's cpus, so only vector reads cross the interconnect.
 #
-# NEAR and FAR must sit on different packages. Node 1 looks like a far node by number but shares
-# package 0 with node 0: throttling it would slow near memory too, and it is only one SNC hop
-# away rather than a socket hop. The package check below refuses that configuration outright.
+# NEAR and FAR must sit on different packages -- true by construction here (one node per package),
+# but the package check below still verifies it at runtime rather than assuming it.
 #
 # Throttling: uncore (mesh/IMC) frequency is package-scoped, so the far package is slowed as a
 # whole -- node 2 rides along, unused. Preferred path is the intel_uncore_frequency driver, which
@@ -54,7 +52,7 @@ REPO=${REPO:-$([ -d "$ROOT/flatnav" ] && echo "$ROOT/flatnav" || echo "$HOME/fla
 BIN=${BIN:-$HOME/spec_search_bench}
 SRC=$REPO/tools/spec_search.cpp
 
-T=${T:-16}                       # search threads
+T=${T:-32}                       # search threads
 EF=${EF:-200}
 K=${K:-100}
 NQ=${NQ:-20000}                  # queries for the timed sections
@@ -63,8 +61,8 @@ DEPTHS=${DEPTHS:-1,2,4,8}
 PQ_M=${PQ_M:-16}
 
 NEAR=${NEAR:-0}                  # graph, PQ codes, staging buffer, and all cpus
-FAR=${FAR:-3}                    # vectors
-HELPER_CPUS=${HELPER_CPUS:-76,77,78,79}   # node-0 cpus for the staging helpers
+FAR=${FAR:-1}                    # vectors
+HELPER_CPUS=${HELPER_CPUS:-92,93,94,95}   # node-0 cpus for the staging helpers
 BUF_SLOTS=${BUF_SLOTS:-4194304}           # staging capacity in vectors (~2 GB at 512 B)
 RATIOS=${RATIOS:-24 16 8 4}               # far-node uncore ratios, 100 MHz units
 
@@ -87,7 +85,7 @@ pkg_of_cpu() { local f="/sys/devices/system/cpu/cpu$1/topology/physical_package_
 for n in "$NEAR" "$FAR"; do
   [ -d "/sys/devices/system/node/node$n" ] || {
     echo "no NUMA node $n on this host. Available: $(ls -d /sys/devices/system/node/node[0-9]* | sed 's#.*/node##' | tr '\n' ' ')"
-    echo "Set NEAR= and FAR= for this topology (FAR defaults to 3, which assumes a quad-socket node)."
+    echo "Set NEAR= and FAR= for this topology (FAR defaults to 1, which assumes this dual-socket node)."
     exit 1; }
 done
 NEAR_CPU=$(first_cpu_of_node "$NEAR")
@@ -102,7 +100,7 @@ FAR_PKG=$(pkg_of_cpu "$REMOTE_CPU")
 [ "$NEAR_PKG" != "$FAR_PKG" ] || {
   echo "node $NEAR (cpu $NEAR_CPU) and node $FAR (cpu $REMOTE_CPU) are both on package $FAR_PKG."
   echo "Uncore frequency is package-scoped, so throttling the far node would slow near memory too."
-  echo "With sub-NUMA clustering the nodes of one socket share a package; pick FAR= on the other."
+  echo "Pick a FAR= node that sits on a different package."
   exit 1; }
 
 # --- save the far package's uncore frequency, restore on any exit --------------------------
