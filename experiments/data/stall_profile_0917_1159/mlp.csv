@@ -1,0 +1,7 @@
+# started on Thu Sep 17 12:03:55 2026
+
+2290598525528,,cycles,877378545373,100.00,,
+19616145366157,,l1d_pend_miss.pending,877367806718,100.00,,
+1891508049355,,l1d_pend_miss.pending_cycles,877357264478,100.00,,
+16244937303468,,offcore_requests_outstanding.demand_data_rd,877346536092,100.00,,
+1866505165360,,offcore_requests_outstanding.cycles_with_demand_data_rd,877335137333,100.00,,

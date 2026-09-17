@@ -1,0 +1,6 @@
+# started on Thu Sep 17 12:04:59 2026
+
+2215206138989,,cycles,868963479697,100.00,,
+21960649217,,mem_load_retired.l3_miss,868953510610,100.00,,
+977903790,,mem_load_l3_miss_retired.local_dram,868944782296,100.00,,
+20982206333,,mem_load_l3_miss_retired.remote_dram,868935857668,100.00,,

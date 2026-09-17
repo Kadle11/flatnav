@@ -1,0 +1,6 @@
+# started on Thu Sep 17 12:06:03 2026
+
+S0,1,20774365351,,uncore_imc/cas_count_read/,242076478530,100.00,,
+S0,1,17949538168,,uncore_imc/cas_count_write/,242075672969,100.00,,
+S1,1,46199797447,,uncore_imc/cas_count_read/,242071154816,100.00,,
+S1,1,61602561,,uncore_imc/cas_count_write/,242070184335,100.00,,

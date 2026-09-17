@@ -1,0 +1,33 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu/mem-loads-aux/'
+# Total weight : 1616
+# Sort order   : mem
+#
+# Overhead  Memory access                          
+# ........  .......................................
+#
+   100.00%  N/A                                    
+
+
+# Samples: 10K of event 'cpu/mem-loads,ldlat=128/P'
+# Total weight : 10918
+# Sort order   : mem
+#
+# Overhead  Memory access                          
+# ........  .......................................
+#
+    42.80%  Remote RAM hit                         
+    28.08%  L1 hit                                 
+    18.99%  LFB/MAB hit                            
+     4.32%  L3 hit                                 
+     3.14%  RAM hit                                
+     2.67%  L2 hit                                 
+
+
+#
+# (Tip: To record callchains for each sample: perf record -g)
+#

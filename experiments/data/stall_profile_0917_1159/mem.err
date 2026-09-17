@@ -1,0 +1,4 @@
+Events disabled
+Events enabled
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 3.886 MB /home/labuser/vishal/stall_profile_0917_1159/mem.data (12534 samples) ]

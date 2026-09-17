@@ -1,0 +1,41 @@
+=== stall profile: solab-s6 2026-09-17T12:08:15-07:00 ===
+idx=/home/labuser/vishal/index/sift100m_flatnav.bin ef=80x12 K=10 T=32 cpus=node0 vectors=1 graph=0
+window: perf -D 35062ms (warmup_done=34.762s), search=28.986s of program time
+
+-- TMA, share of issue slots (PERF_METRICS, level 1 then the backend split) --
+  retiring                  7.2%
+  bad_speculation          11.3%
+  frontend_bound            3.5%
+  backend_bound            78.2%
+    .memory_bound          65.2%   <-- time the core had nothing to issue with a load outstanding
+
+-- stall cycles, share of core cycles (lower bound: overlap is not counted) --
+  IPC                      0.42
+  stalled_any              73.4%
+  stalled_memory           60.9%
+    .l2_miss               60.3%
+    .l3_miss               57.4%   <-- stalled with the miss all the way out at DRAM
+  overlapped               25.5%   <-- miss in flight but the core still retired: latency that cost nothing
+
+-- memory-level parallelism (misses in flight while any is outstanding) --
+  avg_l1d_misses          10.37    <-- low => latency-bound (issue earlier helps); high => bandwidth-bound
+
+-- where the L3 misses were served (retired loads) --
+  local_dram                4.5%
+  remote_dram              95.5%
+  l3_miss_loads          21960649217
+
+-- achieved DRAM bandwidth over the 28.986s search window --
+  S0_read                  45.9 GB/s   (raw CAS x64B)
+  S0_write                 39.6 GB/s   (raw CAS x64B)
+  S1_read                 102.0 GB/s   (raw CAS x64B)
+  S1_write                  0.1 GB/s   (raw CAS x64B)
+
+-- sampled load latency by memory level (>= 128 cycles) --
+    42.80%  Remote RAM hit                         
+    28.08%  L1 hit                                 
+    18.99%  LFB/MAB hit                            
+     4.32%  L3 hit                                 
+     3.14%  RAM hit                                
+     2.67%  L2 hit                                 
+  full report: /home/labuser/vishal/stall_profile_0917_1159/mem_by_level.txt ; by symbol: /home/labuser/vishal/stall_profile_0917_1159/mem_by_symbol.txt
