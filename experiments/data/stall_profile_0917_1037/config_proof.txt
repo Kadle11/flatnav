@@ -1,0 +1,12 @@
+=== hwguard config record ===
+host=solab-s6  date=2026-09-17T10:37:07-07:00  kernel=6.6.0-rc6-128gb-full-sharing
+numa_balancing=0
+uncore_domain=none (MSR path)
+thp=always [madvise] never
+node 0 size: 257663 MB
+node 0 free: 154997 MB
+node 1 size: 257991 MB
+node 1 free: 191377 MB
+node distances:
+  0:  10  21 
+  1:  21  10 

@@ -1,0 +1,14 @@
+# started on Thu Sep 17 10:39:13 2026
+
+
+ Performance counter stats for 'env numactl --cpunodebind=0 --membind=0 /home/labuser/hbw_search_stall /home/labuser/vishal/index/sift100m_flatnav.bin /home/labuser/vishal/flatnav/SIFT-200K/sift100m_200k_extra_query.fvecs /home/labuser/vishal/flatnav/SIFT-200K/sift100m_200k_extra_query.gtruth.ivecs 10 32 80,80,80,80,80,80,80,80,80,80,80,80':
+
+ %  tma_branch_mispredicts    %  tma_core_bound %  tma_heavy_operations %  tma_light_operations  %  tma_memory_bound %  tma_fetch_bandwidth %  tma_fetch_latency %  tma_machine_clears 
+                      10.8                         12.9                              0.4                              6.6                 65.7                             1.7                          1.6                            0.3 
+
+      29.870674028 seconds time elapsed
+
+    1033.359323000 seconds user
+      29.409652000 seconds sys
+
+
