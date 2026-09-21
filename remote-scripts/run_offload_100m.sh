@@ -300,7 +300,7 @@ for r in $RATIOS; do
   for f in "spec_nostage_r$r" "offload_r$r"; do
     [ -s "$OUT/$f.log" ] || continue
     echo "[$f]"
-    grep -E '^\[exact\]|^\[offload\]' "$OUT/$f.log" || true
+    grep -E '^\[exact\]|^\[exact-end\]|^\[offload\]' "$OUT/$f.log" || true
     grep -E "^[0-9]+ +1 " "$OUT/$f.log" || true
   done
 done

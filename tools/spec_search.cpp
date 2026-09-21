@@ -262,6 +262,44 @@ int main(int argc, char** argv) {
   // Codes installed, gate window empty: beamSearch stays fully exact and is the baseline.
   index->setPQGate(codes.data(), (uint32_t)m, 0, 0);
 
+  const uint32_t BLOCK = 64;
+  const uint32_t nblocks = (uint32_t)((nq + BLOCK - 1) / BLOCK);
+
+  // --- exact baseline: results, expansion order, and vector reads, per query ---
+  std::vector<std::vector<std::pair<float, int>>> base_res(nq);
+  std::vector<std::vector<uint32_t>> base_exp(nq);
+  std::vector<uint32_t> base_reads(nq);
+  // One exact pass. Run first as the reference, and again after the last row.
+  auto exactPass = [&](std::vector<std::vector<std::pair<float, int>>>& res,
+                       std::vector<std::vector<uint32_t>>& exps, std::vector<uint32_t>& reads) {
+    index->setSpecPipeline(0, 1, false);
+    auto t = clk::now();
+    flatnav::executeInParallel(0, nblocks, (uint32_t)threads, [&](uint32_t blk) {
+      std::vector<float> lut((size_t)m * kCentroids);
+      size_t qlo = (size_t)blk * BLOCK, qhi = std::min(qlo + BLOCK, nq);
+      for (size_t i = qlo; i < qhi; i++) {
+        buildLUT(&queries[i * qdim], codebooks.data(), m, sub_dim, lut.data());
+        exps[i].clear();
+        flatnav::tl_pq_lut = lut.data();
+        flatnav::tl_spec_expand = &exps[i];
+        res[i] = index->search((const void*)&queries[i * qdim], K, ef);
+        flatnav::tl_spec_expand = nullptr;
+        flatnav::tl_pq_lut = nullptr;
+        reads[i] = flatnav::tl_gate_exact + 1;  // + the entry node, which the gate does not count
+      }
+    });
+    return std::chrono::duration<double>(clk::now() - t).count();
+  };
+  const double base_secs = exactPass(base_res, base_exp, base_reads);
+  double base_steps = 0, base_rd = 0;
+  for (size_t i = 0; i < nq; i++) { base_steps += base_exp[i].size(); base_rd += base_reads[i]; }
+  printf("[exact] %zu queries in %.2fs (%.0f qps), mean %.1f expansions, %.1f reads/query",
+         nq, base_secs, nq / base_secs, base_steps / nq, base_rd / nq);
+  if (!gt_topk.empty()) printf(", recall@%d=%.4f", K, recallOf(base_res));
+  printf("\n\n");
+  fflush(stdout);
+
+  // Worker threads start only now, so none of them spin while the baseline above is timed.
   // Staging helpers. The ring is fed by the speculative lane with the exact ids validation will
   // read, so `_pf_k` stays 0 -- the top-K-candidate feeder that beamSearch uses is not wanted here.
   std::vector<int> helper_cpus = flatnav::parseCpuList(getenv("PF_HELPER_CPUS"));
@@ -315,38 +353,6 @@ int main(int argc, char** argv) {
            vo_cpus.size(), getenv("VO_CPUS"), vec_node, graph_node);
     fflush(stdout);
   }
-
-  const uint32_t BLOCK = 64;
-  const uint32_t nblocks = (uint32_t)((nq + BLOCK - 1) / BLOCK);
-
-  // --- exact baseline: results, expansion order, and vector reads, per query ---
-  std::vector<std::vector<std::pair<float, int>>> base_res(nq);
-  std::vector<std::vector<uint32_t>> base_exp(nq);
-  std::vector<uint32_t> base_reads(nq);
-  index->setSpecPipeline(0, 1, false);
-  auto t3 = clk::now();
-  flatnav::executeInParallel(0, nblocks, (uint32_t)threads, [&](uint32_t blk) {
-    std::vector<float> lut((size_t)m * kCentroids);
-    size_t qlo = (size_t)blk * BLOCK, qhi = std::min(qlo + BLOCK, nq);
-    for (size_t i = qlo; i < qhi; i++) {
-      buildLUT(&queries[i * qdim], codebooks.data(), m, sub_dim, lut.data());
-      base_exp[i].clear();
-      flatnav::tl_pq_lut = lut.data();
-      flatnav::tl_spec_expand = &base_exp[i];
-      base_res[i] = index->search((const void*)&queries[i * qdim], K, ef);
-      flatnav::tl_spec_expand = nullptr;
-      flatnav::tl_pq_lut = nullptr;
-      base_reads[i] = flatnav::tl_gate_exact + 1;  // + the entry node, which the gate does not count
-    }
-  });
-  const double base_secs = std::chrono::duration<double>(clk::now()-t3).count();
-  double base_steps = 0, base_rd = 0;
-  for (size_t i = 0; i < nq; i++) { base_steps += base_exp[i].size(); base_rd += base_reads[i]; }
-  printf("[exact] %zu queries in %.2fs (%.0f qps), mean %.1f expansions, %.1f reads/query",
-         nq, base_secs, nq / base_secs, base_steps / nq, base_rd / nq);
-  if (!gt_topk.empty()) printf(", recall@%d=%.4f", K, recallOf(base_res));
-  printf("\n\n");
-  fflush(stdout);
 
   // Armed only now: the exact baseline above must not pay for staged lookups that can never hit.
   if (pf_buf) index->setPrefetchStaging(pf_buf, pf_ring, /* k = */ 0);
@@ -468,6 +474,29 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Exact again, last, with every worker stopped and the pipeline disarmed -- the conditions of
+  // the first pass. That pass ran before any row and paid warm-up the rows did not, so it can
+  // understate the baseline; report both and let the reader take the later one.
+  pf_stop.store(true, std::memory_order_relaxed);
+  for (auto& h : helpers) h.join();
+  vo_stop.store(true, std::memory_order_relaxed);
+  for (auto& w : vo_workers) w.join();
+  index->setPrefetchStaging(nullptr, nullptr, 0);
+  index->setValidationOffload(nullptr);
+  {
+    std::vector<std::vector<std::pair<float, int>>> end_res(nq);
+    std::vector<std::vector<uint32_t>> end_exp(nq);
+    std::vector<uint32_t> end_reads(nq);
+    const double end_secs = exactPass(end_res, end_exp, end_reads);
+    printf("\n[exact-end] %zu queries in %.2fs (%.0f qps), qps %+.1f%% vs the first exact pass\n",
+           nq, end_secs, nq / end_secs, 100.0 * (base_secs / end_secs - 1.0));
+    if (end_res != base_res || end_exp != base_exp || end_reads != base_reads) {
+      all_ok = false;
+      printf("      FAIL exact-end: results differ from the first exact pass\n");
+    }
+    fflush(stdout);
+  }
+
   printf("\n# checks/q  predictions tested per query; the first pick off an empty ring is not one\n");
   printf("# miss%%     share of predictions the validated lane did not confirm\n");
   printf("# disc/q    speculative steps thrown away | wasted/q  their vectors\n");
@@ -488,10 +517,6 @@ int main(int argc, char** argv) {
     printf("\n%s\n", all_ok ? "PASS: results, expansion order and read counts identical to exact"
                             : "FAIL: see mismatches above");
 
-  pf_stop.store(true, std::memory_order_relaxed);
-  for (auto& h : helpers) h.join();
-  vo_stop.store(true, std::memory_order_relaxed);
-  for (auto& w : vo_workers) w.join();
   delete pf_buf;
   delete pf_ring;
   delete vo_pool;

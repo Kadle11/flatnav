@@ -332,11 +332,12 @@ report() {
   local t0; t0=$(< "$OUT/$tag.t0")
   echo
   echo "=== $tag ==="
-  grep -E '\[offload\]|\[exact\]' "$OUT/$tag.log" | sed 's/^[0-9.]* //' || true
+  grep -E '\[offload\]|\[exact\]|\[exact-end\]' "$OUT/$tag.log" | sed 's/^[0-9.]* //' || true
 
   # (stamp, label, duration) for every timed region: the exact baseline, then each pipeline row.
   awk -v nq="$NQ" '
     $2=="[exact]" { print $1, "exact", $6+0 }
+    $2=="[exact-end]" { print $1, "exact-end", $6+0 }
     $2 ~ /^[0-9]+$/ && $3=="1" { print $1, "k="$2, nq/($10+0) }
   ' "$OUT/$tag.log" | while read -r stamp label dur; do
     lo=$(awk -v s="$stamp" -v t="$t0" -v d="$dur" -v g="$GUARD" 'BEGIN{printf "%.3f", s-t-d+g}')
