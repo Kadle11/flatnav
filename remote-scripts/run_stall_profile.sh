@@ -146,8 +146,8 @@ have_ev() {
 }
 keep_evs() { local out="" e; for e in $1; do have_ev "$e" && out+="${out:+,}$e" || echo "  [drop] $e not supported here" >&2; done; echo "$out"; }
 
-marker_of() { sed -n 's/.*warmup_done elapsed_s=\([0-9.]*\).*/\1/p' "$1" | tail -1; }
-searchsec_of() { awk '$1 ~ /^[0-9]+$/ && NF>=4 {s+=$2} END{printf "%.3f", s}' "$1"; }
+marker_of() { [ -s "$1" ] || return 0; sed -n 's/.*warmup_done elapsed_s=\([0-9.]*\).*/\1/p' "$1" | tail -1; }
+searchsec_of() { [ -s "$1" ] || return 0; awk '$1 ~ /^[0-9]+$/ && NF>=4 {s+=$2} END{printf "%.3f", s}' "$1" || true; }
 
 # --- calibration: where does the search actually start? -------------------------------------
 echo "[cfg] idx=$IDX"
@@ -185,7 +185,13 @@ run_stat() {   # $1=tag  $2=events  $3...=extra perf args
 
 # $1=csv $2=event substring -> summed value ("" when absent). Matches by name, not column index,
 # so --per-socket rows (which shift every field right) parse with the same helper.
-val() { awk -F, -v e="$2" '{for(i=1;i<=NF;i++) if($i==e){gsub(/[^0-9.]/,"",$1); if($1!="") s+=$1}} END{printf "%s", (s==""?"":s)}' "$1" 2>/dev/null; }
+# Returns empty and SUCCEEDS when the file is absent. A pass skipped by ONLY= leaves no csv, and
+# awk exits non-zero on a missing file -- which `CYC=$(val ...)` propagates, so under `set -e` the
+# run would die partway through writing a summary it had already computed.
+val() {
+  [ -s "$1" ] || return 0
+  awk -F, -v e="$2" '{for(i=1;i<=NF;i++) if($i==e){gsub(/[^0-9.]/,"",$1); if($1!="") s+=$1}} END{printf "%s", (s==""?"":s)}' "$1" 2>/dev/null || true
+}
 pct() { awk -v n="$1" -v d="$2" 'BEGIN{if(d>0 && n!="") printf "%.1f", 100*n/d; else printf "?"}'; }
 
 want() { [ "$ONLY" = all ] || [ "$ONLY" = "$1" ]; }
